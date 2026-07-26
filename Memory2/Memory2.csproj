@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <RootNamespace>Memory2</RootNamespace>
+    <AssemblyName>Memory2</AssemblyName>
+    <Deterministic>true</Deterministic>
+    <LangVersion>10.0</LangVersion>
+    <AssemblyTitle>Memory2</AssemblyTitle>
+    <ApplicationIcon>favicon.ico</ApplicationIcon>
+    <Title>Memory2</Title>
+    <Description>Memory2 gives C# and .NET one fast, queryable, reactive, and durable state for the entire application.</Description>
+    <PackageProjectUrl>https://memory2.io</PackageProjectUrl>
+    <PackageIcon>favicon.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Content Include="favicon.ico" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\favicon.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+  </ItemGroup>
+</Project>
