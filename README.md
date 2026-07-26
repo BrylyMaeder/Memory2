@@ -208,10 +208,10 @@ Vehicle vehicle = vehicles.Create(new Vehicle
 
 ## Read data
 
-Use `GetRequired` when the object must exist.
+Use `Load` when the object must exist.
 
 ```csharp
-Account account = accounts.GetRequired(accountId);
+Account account = accounts.Load(accountId);
 ```
 
 A required read returns the complete C# object.
@@ -271,7 +271,7 @@ Tire[] tires = db.From<Tire>()
 **Read** retrieves a known object by identity.
 
 ```csharp
-Account account = accounts.GetRequired(accountId);
+Account account = accounts.Load(accountId);
 ```
 
 Use the least expensive operation that returns what the application actually needs.
@@ -513,7 +513,7 @@ Save the tracked object returned by Memory2. A newly constructed object with sim
 ### Update a loaded root
 
 ```csharp
-Account account = accounts.GetRequired(accountId);
+Account account = accounts.Load(accountId);
 account.Balance += 100m;
 
 db.Save(account);
@@ -589,7 +589,7 @@ using var subscription = events.Subscribe(
 Change state normally:
 
 ```csharp
-OperationalEvent item = events.GetRequired(eventId);
+OperationalEvent item = events.Load(eventId);
 item.Topic = "orders";
 item.Ready = true;
 item.Severity = 9;
@@ -706,7 +706,7 @@ if (!verification.IsValid)
 
 ```csharp
 using var reopened = MemoryStore.Open("application.m2");
-Account restored = reopened.Set<Account>().GetRequired(accountId);
+Account restored = reopened.Set<Account>().Load(accountId);
 ```
 
 ### Stream example
@@ -729,7 +729,7 @@ using (var db = MemoryStore.Open(stream, leaveOpen: true))
 stream.Position = 0;
 
 using var restoredDb = MemoryStore.Open(stream, leaveOpen: true);
-Account restored = restoredDb.Set<Account>().GetRequired(1);
+Account restored = restoredDb.Set<Account>().Load(1);
 ```
 
 ### Durability guidance
@@ -748,7 +748,7 @@ A read and a query solve different problems.
 ### Read
 
 ```csharp
-Account account = accounts.GetRequired(id);
+Account account = accounts.Load(id);
 ```
 
 A read builds the complete C# object because application code asked for the object.
@@ -1071,7 +1071,7 @@ db.Verify()
 ```csharp
 db.Set<T>()
 set.Create(model)
-set.GetRequired(id)
+set.Load(id)
 set.Upsert(model)
 set.Delete(id)
 set.Subscribe(predicate, handler)
