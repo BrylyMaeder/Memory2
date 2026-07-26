@@ -12,12 +12,20 @@
     <PackageProjectUrl>https://memory2.io</PackageProjectUrl>
     <PackageIcon>favicon.png</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/BrylyMaeder/Memory2</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>memory, database, linq, query, fast</PackageTags>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
   </PropertyGroup>
   <ItemGroup>
     <Content Include="favicon.ico" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\favicon.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\LICENSE">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
