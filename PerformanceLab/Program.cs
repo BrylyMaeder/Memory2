@@ -118,16 +118,22 @@ internal static class Program
     private static double _lastLawfulSyncReplayNs;
     public static int Main(string[] args)
     {
+        if (Array.Exists(args, x => string.Equals(x, "--similarity-proof", StringComparison.OrdinalIgnoreCase)))
+            return SimilarityProofLab.Run(args);
+
+        if (Array.Exists(args, x => string.Equals(x, "--comparative-proof", StringComparison.OrdinalIgnoreCase)))
+            return ComparativeProofLab.Run(args);
+
         PerformanceConfiguration configuration = PerformancePopulationSelector.Select();
         PerformancePopulation selectedPopulation = PerformancePopulation.OneHundredMillion;
 
-        // The selected scale is now the one and only live population used by the
-        // performance lab. Seed it first, then run the entire system spectrum
-        // against that same multi-model store.
-        MixedStructure10MStressLab.Run(configuration);
-        return 0;
+        if (!Array.Exists(args, x => string.Equals(x, "--legacy-suite", StringComparison.OrdinalIgnoreCase)))
+        {
+            // The selected scale is the one live population used by the default lab.
+            MixedStructure10MStressLab.Run(configuration);
+            return 0;
+        }
 
-#pragma warning disable CS0162
         long records = ReadLong(args, "--records", 1_000_000);
         int batchSize = (int)ReadLong(args, "--batch-size", 4096);
         int overrideEvery = (int)ReadLong(args, "--override-every", 64);
@@ -413,7 +419,6 @@ internal static class Program
         LabProgress.Complete("selected large-domain stress");
         LabProgress.Finish();
         return 0;
-#pragma warning restore CS0162
     }
 
 

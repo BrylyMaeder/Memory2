@@ -272,6 +272,23 @@ namespace Memory2
             return writer.BaseStream.Position - start;
         }
 
+        public void ReadCompact(BinaryReader reader, int expectedLiveCount, string[] stringPool)
+        {
+            string propertyName = reader.ReadString();
+            byte typeCode = reader.ReadByte();
+            bool permitsNull = reader.ReadBoolean();
+            int liveCount = reader.ReadInt32();
+            Type declared = Property.PropertyType;
+            Type valueType = Nullable.GetUnderlyingType(declared) ?? declared;
+            bool expectedPermitsNull = Nullable.GetUnderlyingType(declared) != null || !valueType.IsValueType;
+            if (!string.Equals(propertyName, Property.Name, StringComparison.Ordinal) ||
+                typeCode != GetTypeCode(valueType) || permitsNull != expectedPermitsNull ||
+                liveCount != expectedLiveCount)
+                throw new InvalidDataException("The persisted lawful column does not match " + Property.DeclaringType.Name + "." + Property.Name + ".");
+            if (liveCount > _values.Length) throw new InvalidDataException("The persisted lawful column exceeds allocated capacity.");
+            for (int i = 0; i < liveCount; i++) Write(i, ReadCompactValue(reader, valueType, permitsNull, stringPool));
+        }
+
         private static byte GetTypeCode(Type type)
         {
             if (type.IsEnum) return 1;
@@ -327,6 +344,52 @@ namespace Memory2
             else if (type == typeof(Uri)) writer.Write(stringPool[((Uri)value).OriginalString]);
             else if (type == typeof(byte[])) { byte[] bytes=(byte[])value; writer.Write(bytes.Length); writer.Write(bytes); }
         }
+
+        private static object ReadCompactValue(BinaryReader reader, Type type, bool permitsNull, string[] stringPool)
+        {
+            if (permitsNull && !reader.ReadBoolean()) return null;
+            if (type.IsEnum) return Enum.ToObject(type, reader.ReadInt64());
+            if (type == typeof(string)) return ReadPooledString(reader, stringPool);
+            if (type == typeof(bool)) return reader.ReadBoolean();
+            if (type == typeof(byte)) return reader.ReadByte();
+            if (type == typeof(sbyte)) return reader.ReadSByte();
+            if (type == typeof(short)) return reader.ReadInt16();
+            if (type == typeof(ushort)) return reader.ReadUInt16();
+            if (type == typeof(int)) return reader.ReadInt32();
+            if (type == typeof(uint)) return reader.ReadUInt32();
+            if (type == typeof(long)) return reader.ReadInt64();
+            if (type == typeof(ulong)) return reader.ReadUInt64();
+            if (type == typeof(float)) return reader.ReadSingle();
+            if (type == typeof(double)) return reader.ReadDouble();
+            if (type == typeof(decimal)) return reader.ReadDecimal();
+            if (type == typeof(char)) return reader.ReadChar();
+            if (type == typeof(DateTime)) return DateTime.FromBinary(reader.ReadInt64());
+            if (type == typeof(DateTimeOffset)) return new DateTimeOffset(reader.ReadInt64(), new TimeSpan(reader.ReadInt64()));
+            if (type == typeof(TimeSpan)) return new TimeSpan(reader.ReadInt64());
+            if (type == typeof(Guid)) return new Guid(ReadExactBytes(reader, 16));
+            if (type == typeof(Uri)) return new Uri(ReadPooledString(reader, stringPool), UriKind.RelativeOrAbsolute);
+            if (type == typeof(byte[]))
+            {
+                int length = reader.ReadInt32();
+                if (length < 0) throw new InvalidDataException("A persisted byte array has a negative length.");
+                return ReadExactBytes(reader, length);
+            }
+            throw new InvalidDataException("Unsupported persisted lawful scalar type " + type.FullName + ".");
+        }
+
+        private static string ReadPooledString(BinaryReader reader, string[] stringPool)
+        {
+            int index = reader.ReadInt32();
+            if ((uint)index >= (uint)stringPool.Length) throw new InvalidDataException("A persisted string-pool index is invalid.");
+            return stringPool[index];
+        }
+
+        private static byte[] ReadExactBytes(BinaryReader reader, int count)
+        {
+            byte[] bytes = reader.ReadBytes(count);
+            if (bytes.Length != count) throw new EndOfStreamException("The lawful store ended inside a binary scalar.");
+            return bytes;
+        }
     }
 
     internal readonly struct LawfulObjectIdentity
@@ -363,6 +426,7 @@ namespace Memory2
 
     public sealed class LawfulMemoryStore<TRoot> : IDisposable where TRoot : class, new()
     {
+        private const string PersistenceMagic = "M2LAWFUL-HIGHLEVEL-4";
         private readonly LawfulSchema _schema;
         private readonly ConditionalWeakTable<object, LawfulIdentityBox> _identities = new ConditionalWeakTable<object, LawfulIdentityBox>();
         private readonly RootVisibilityLaw _rootVisibility;
@@ -404,6 +468,7 @@ namespace Memory2
                 _setRootId = Expression.Lambda<Action<TRoot, long>>(
                     Expression.Assign(Expression.Property(rootParameter, id), idParameter), rootParameter, idParameter).Compile();
             }
+            if (_stream.CanSeek && _stream.Length > 0) Load();
         }
 
         /// <summary>Maximum live root population supported by this implementation.</summary>
@@ -560,9 +625,10 @@ namespace Memory2
         public bool Apply(LawfulScalarMutation mutation)
         {
             if (mutation == null) throw new ArgumentNullException(nameof(mutation));
-            if (!_appliedMutations.Add(mutation.MutationId)) return false;
+            if (_appliedMutations.Contains(mutation.MutationId)) return false;
             if (!_schema.TryShape(mutation.NodeType, out LawfulNodeShape shape)) throw new InvalidOperationException("The mutation type is not part of the lawful schema.");
             if ((uint)mutation.RootIndex >= (uint)_nextRoot || !_rootVisibility.IsVisible(mutation.RootIndex)) throw new InvalidOperationException("The mutation root is not live.");
+            _appliedMutations.Add(mutation.MutationId);
             int index = Index(shape, mutation.RootIndex, mutation.LocalIndex);
             ulong before = EvaluateSubscriptions(shape, index);
             for (int i = 0; i < shape.Scalars.Count; i++) shape.Scalars[i].Write(index, mutation.Values[i]);
@@ -713,12 +779,15 @@ namespace Memory2
             }
             using (var writer = new BinaryWriter(_stream, Encoding.UTF8, true))
             {
-                writer.Write("M2LAWFUL-HIGHLEVEL-2");
+                writer.Write(PersistenceMagic);
                 long schemaStart = _stream.Position;
                 writer.Write(typeof(TRoot).FullName ?? typeof(TRoot).Name);
                 writer.Write(_nextRoot);
-                writer.Write(_nextRoot);
+                writer.Write(_schema.AllocatedRootCapacity);
                 _rootVisibility.Write(writer);
+                writer.Write(_appliedMutations.Count);
+                foreach (Guid mutationId in _appliedMutations.OrderBy(x => x))
+                    writer.Write(mutationId.ToByteArray());
                 LawfulNodeShape[] shapes = _schema.Shapes.OrderBy(x => x.Type.FullName).ToArray();
                 writer.Write(shapes.Length);
                 foreach (LawfulNodeShape shape in shapes)
@@ -754,6 +823,84 @@ namespace Memory2
                 _lastColumnBytes = _stream.Position - columnStart;
             }
             _stream.Flush();
+        }
+
+        private void Load()
+        {
+            if (!_stream.CanRead || !_stream.CanSeek)
+                throw new NotSupportedException("A persisted lawful store must be readable and seekable.");
+            long original = _stream.Position;
+            _stream.Position = 0;
+            try
+            {
+                using (var reader = new BinaryReader(_stream, Encoding.UTF8, true))
+                {
+                    if (reader.ReadString() != PersistenceMagic)
+                        throw new InvalidDataException("The stream is not a supported lawful Memory2 store.");
+                    string rootTypeName = reader.ReadString();
+                    if (!string.Equals(rootTypeName, typeof(TRoot).FullName ?? typeof(TRoot).Name, StringComparison.Ordinal))
+                        throw new InvalidDataException("The persisted lawful root type does not match " + typeof(TRoot).FullName + ".");
+                    int rootCount = reader.ReadInt32();
+                    int allocatedCapacity = reader.ReadInt32();
+                    if (rootCount < 0 || rootCount > MaximumPopulation || allocatedCapacity < rootCount)
+                        throw new InvalidDataException("The persisted lawful root population is invalid.");
+                    _rootVisibility.Read(reader, rootCount);
+                    int appliedMutationCount = reader.ReadInt32();
+                    if (appliedMutationCount < 0 || appliedMutationCount > 100_000_000)
+                        throw new InvalidDataException("The persisted lawful mutation ledger is invalid.");
+                    _appliedMutations.Clear();
+                    for (int i = 0; i < appliedMutationCount; i++)
+                    {
+                        byte[] bytes = reader.ReadBytes(16);
+                        if (bytes.Length != 16) throw new EndOfStreamException("The lawful mutation ledger is truncated.");
+                        if (!_appliedMutations.Add(new Guid(bytes)))
+                            throw new InvalidDataException("The persisted lawful mutation ledger contains a duplicate identifier.");
+                    }
+
+                    LawfulNodeShape[] shapes = _schema.Shapes.OrderBy(x => x.Type.FullName).ToArray();
+                    int shapeCount = reader.ReadInt32();
+                    if (shapeCount != shapes.Length) throw new InvalidDataException("The persisted lawful schema has a different shape count.");
+                    for (int i = 0; i < shapes.Length; i++)
+                    {
+                        LawfulNodeShape shape = shapes[i];
+                        string typeName = reader.ReadString();
+                        int itemsPerRoot = reader.ReadInt32();
+                        int parentIndex = reader.ReadInt32();
+                        int cardinality = reader.ReadInt32();
+                        int scalarCount = reader.ReadInt32();
+                        int expectedParent = shape.Parent == null ? -1 : Array.IndexOf(shapes, shape.Parent);
+                        int expectedCardinality = shape.Incoming == null ? 0 : shape.Incoming.Cardinality;
+                        if (!string.Equals(typeName, shape.Type.FullName ?? shape.Type.Name, StringComparison.Ordinal) ||
+                            itemsPerRoot != shape.ItemsPerRoot || parentIndex != expectedParent ||
+                            cardinality != expectedCardinality || scalarCount != shape.Scalars.Count)
+                            throw new InvalidDataException("The persisted lawful schema does not match shape " + shape.Type.FullName + ".");
+                    }
+
+                    int poolCount = reader.ReadInt32();
+                    if (poolCount < 0 || poolCount > 100_000_000) throw new InvalidDataException("The persisted lawful string pool is invalid.");
+                    var stringPool = new string[poolCount];
+                    for (int i = 0; i < stringPool.Length; i++) stringPool[i] = reader.ReadString();
+
+                    if (rootCount > _schema.AllocatedRootCapacity) _schema.EnsureRootCapacity(rootCount);
+                    if (_rootGeneration.Length < _schema.AllocatedRootCapacity)
+                        Array.Resize(ref _rootGeneration, _schema.AllocatedRootCapacity);
+                    for (int i = 0; i < rootCount; i++) _rootGeneration[i] = 1;
+
+                    foreach (LawfulNodeShape shape in shapes)
+                    {
+                        int scalarCount = reader.ReadInt32();
+                        if (scalarCount != shape.Scalars.Count)
+                            throw new InvalidDataException("The persisted lawful column count does not match " + shape.Type.FullName + ".");
+                        int liveCount = checked(rootCount * shape.ItemsPerRoot);
+                        foreach (LawfulScalarColumn column in shape.Scalars)
+                            column.ReadCompact(reader, liveCount, stringPool);
+                    }
+                    if (_stream.Position != _stream.Length)
+                        throw new InvalidDataException("The lawful store contains trailing payload bytes.");
+                    _nextRoot = rootCount;
+                }
+            }
+            finally { _stream.Position = original; }
         }
 
         private void EnsureCapacityForNextRoot()

@@ -4,6 +4,49 @@ Memory2 gives C# and .NET a new kind of memory.
 
 Store enormous connected systems. Query them with LINQ. Change live state. Keep queries active as subscriptions. Apply ordered synchronization changes. Save the complete store, verify it, and reopen it later.
 
+The native engine is `LawfulMemoryStore<TRoot>`: a fixed-shape column store with arithmetic descendant coordinates, prepared zero-allocation queries, compact persistence, and selective hydration. `MemoryStore` is the flexible compatibility facade for dynamic object graphs. Performance claims apply to the native lawful engine unless a result explicitly names another surface.
+
+## Current measured proof
+
+On the repository's comparative Release runner, Memory2 currently measures:
+
+- 4.46x the throughput of `Dictionary` for prepared scalar point projection;
+- 1.24x the throughput of LINQ-to-Objects for the measured scalar predicate scan;
+- 1.99x the throughput of `Dictionary` for prepared `AT` resolution across 256 rotating keys;
+- 1.93x lower managed footprint, including the active query plan;
+- zero bytes allocated by all measured Memory2 hot paths.
+
+These are same-process measurements over equal values on the documented machine. They are not presented as Redis results. See [BENCHMARKS.md](BENCHMARKS.md) for hardware, methodology, proof thresholds, limitations, and the exact reproduction command.
+
+## Relational AT: search without a stored index
+
+Memory2 can compile a finite, query-time relation into the inverse laws of a generated axis. The relation is a search definition only: preparing it writes no records, signatures, or postings and adds zero bytes per record.
+
+```csharp
+using Memory2;
+using Memory2.At;
+
+var db = MemoryDb.Create(modulus: 4096);
+Collection<Item> items = db.For<Item>();
+
+AtRelation<int> nearby = AtRelation<int>.Create(
+    "nearby",
+    center => new[] { center - 1, center, center + 1 });
+
+PreparedAtRelation<Item> search = items.Relations()
+    .Related(x => x.Score, 500, nearby)
+    .Equal(x => x.Group == 7)
+    .Prepare(AtQueryOptions.StrictOnly);
+
+long count = search.Count(0, 1_000_000_000_000L);
+long firstId = search.ResolveFirstId(0, 1_000_000_000_000L);
+IEnumerable<long> ids = search.ResolveIds(0, 1_000_000L);
+```
+
+On the documented Release proof, enumerating every matching ID was 7.50x faster than scanning the actual generated values across two million coordinates. A closed-form checksum aggregate was 5,459.27x faster. The same aggregate over a one-trillion-record logical population took 712.77 ns/query with zero hot-path allocation. Adding 1,000 sparse physical patches cost 53.02 microseconds/query, also with zero allocation. The relation itself retained zero per-record storage.
+
+This is not a universal constant-time predicate engine. The closed form applies when the relation is finite and its axes are invertible generated laws. Sparse patches cost work proportional to the number of physical exceptions. Enumerating results is necessarily proportional to the number of returned IDs, and non-invertible axes or range transforms use a correctness-first fallback. Full methodology and the `long.MaxValue` boundary result are in [BENCHMARKS.md](BENCHMARKS.md#relational-at-search-proof).
+
 This guide covers Memory2's high-level C# API.
 
 ---
@@ -12,6 +55,7 @@ This guide covers Memory2's high-level C# API.
 
 - [Install](#install)
 - [Open a store](#open-a-store)
+- [Relational AT: search without a stored index](#relational-at-search-without-a-stored-index)
 - [Define models](#define-models)
 - [Work with sets](#work-with-sets)
 - [Create data](#create-data)

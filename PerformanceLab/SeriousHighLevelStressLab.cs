@@ -111,7 +111,7 @@ internal static class SeriousHighLevelStressLab
 
         const int trackedCount = 4096;
         var tracked = new StressRecord[trackedCount];
-        for (int i = 0; i < tracked.Length; i++) tracked[i] = set.GetRequired(1L + (long)i * population / tracked.Length);
+        for (int i = 0; i < tracked.Length; i++) tracked[i] = set.Load(1L + (long)i * population / tracked.Length);
         TimedResult writes = MeasureTrackedWrites(store, tracked, pointOperations);
         PrintResult("High-level tracked Save", writes, "writes");
 
@@ -151,7 +151,7 @@ internal static class SeriousHighLevelStressLab
         PrintLatency("Materializing Get latency", MeasureLatencies(latencySamples, i =>
         {
             long id = 1L + (Mix((uint)i) % (uint)population);
-            return set.GetRequired(id).Entropy;
+            return set.Load(id).Entropy;
         }));
         PrintLatency("Prepared point projection latency", MeasureLatencies(latencySamples, i =>
         {
@@ -206,7 +206,7 @@ internal static class SeriousHighLevelStressLab
     private static void WarmPointReads(LawfulRootSet<StressRecord> set, int population)
     {
         long sink = 0;
-        for (int i = 0; i < 16_384; i++) sink ^= set.GetRequired(1L + Mix((uint)i) % (uint)population).Entropy;
+        for (int i = 0; i < 16_384; i++) sink ^= set.Load(1L + Mix((uint)i) % (uint)population).Entropy;
         GC.KeepAlive(sink);
     }
 
@@ -217,7 +217,7 @@ internal static class SeriousHighLevelStressLab
             long checksum = 0;
             for (int i = 0; i < operations; i++)
             {
-                StressRecord value = set.GetRequired(1L + Mix((uint)i) % (uint)population);
+                StressRecord value = set.Load(1L + Mix((uint)i) % (uint)population);
                 checksum ^= value.Entropy;
                 checksum += value.Score + value.Segment + value.Version + (value.Active ? 1 : 0);
             }

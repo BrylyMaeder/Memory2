@@ -31,14 +31,16 @@ namespace Memory2
 
     public sealed class MemoryStore : IDisposable
     {
-        private const string Magic = "MEMORY2-HIGHLEVEL-2";
+        private const string Magic = "MEMORY2-HIGHLEVEL";
+        private const int FormatVersion = 4;
+        private const int MaximumSerializedCollectionCount = 100_000_000;
         private readonly Stream _stream;
         private readonly bool _leaveOpen;
         private readonly bool _ownsStream;
         private readonly MemoryDb _db;
         private readonly OwnedGraphRegistry _graph = new OwnedGraphRegistry();
         private readonly Dictionary<Type, object> _sets = new Dictionary<Type, object>();
-        private readonly Dictionary<string, List<Dictionary<string, object>>> _pending = new Dictionary<string, List<Dictionary<string, object>>>(StringComparer.Ordinal);
+        private readonly Dictionary<string, PendingSetState> _pending = new Dictionary<string, PendingSetState>(StringComparer.Ordinal);
         private bool _disposed;
 
         private MemoryStore(Stream stream, bool leaveOpen, bool ownsStream, MemoryStoreOptions options)
@@ -47,6 +49,14 @@ namespace Memory2
             _leaveOpen = leaveOpen;
             _ownsStream = ownsStream;
             Options = options ?? throw new ArgumentNullException(nameof(options));
+            if (_stream.CanSeek && _stream.Length > 0)
+            {
+                long original = _stream.Position;
+                _stream.Position = 0;
+                using (var reader = new BinaryReader(_stream, System.Text.Encoding.UTF8, true))
+                    Options.Modulus = ReadHeader(reader).Modulus;
+                _stream.Position = original;
+            }
             _db = MemoryDb.Create(options.Modulus, options.RingSize);
             if (_stream.CanSeek && _stream.Length > 0) LoadPending();
         }
@@ -68,7 +78,8 @@ namespace Memory2
             var options = new MemoryStoreOptions();
             configure?.Invoke(options);
             var stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
-            return new MemoryStore(stream, false, true, options);
+            try { return new MemoryStore(stream, false, true, options); }
+            catch { stream.Dispose(); throw; }
         }
 
         public static MemoryStore CreateInMemory(Action<MemoryStoreOptions> configure = null)
@@ -85,10 +96,11 @@ namespace Memory2
             if (_sets.TryGetValue(typeof(T), out existing)) return (MemorySet<T>)existing;
             var set = new MemorySet<T>(this, _db.For<T>());
             _sets.Add(typeof(T), set);
-            List<Dictionary<string, object>> records;
-            if (_pending.TryGetValue(typeof(T).AssemblyQualifiedName, out records))
+            PendingSetState pending;
+            if (_pending.TryGetValue(typeof(T).AssemblyQualifiedName, out pending))
             {
-                foreach (var record in records) set.LoadRecord(record);
+                foreach (Dictionary<string, object> record in pending.Records) set.LoadRecord(record);
+                set.RestoreSynchronizationState(pending.SynchronizationSequences, pending.MutationVersion);
                 _pending.Remove(typeof(T).AssemblyQualifiedName);
             }
             return set;
@@ -189,10 +201,9 @@ namespace Memory2
             _stream.SetLength(0);
             using (var writer = new BinaryWriter(_stream, System.Text.Encoding.UTF8, true))
             {
-                writer.Write(Magic);
-                writer.Write(Options.Modulus);
                 object[] states = _sets.Values.ToArray();
-                writer.Write(states.Length);
+                KeyValuePair<string, PendingSetState>[] pending = _pending.ToArray();
+                WriteHeader(writer, Options.Modulus, checked(states.Length + pending.Length));
                 foreach (object state in states)
                 {
                     Type modelType = state.GetType().GetGenericArguments()[0];
@@ -201,6 +212,14 @@ namespace Memory2
                     object[] items = ((IEnumerable<object>)snapshot.Invoke(state, null)).ToArray();
                     writer.Write(items.Length);
                     foreach (object item in items) WriteObject(writer, item, modelType);
+                    WriteSynchronizationCheckpoint(writer, state);
+                }
+                foreach (KeyValuePair<string, PendingSetState> entry in pending)
+                {
+                    writer.Write(entry.Key);
+                    writer.Write(entry.Value.Records.Count);
+                    foreach (Dictionary<string, object> record in entry.Value.Records) WriteRecord(writer, record);
+                    WriteSynchronizationCheckpoint(writer, entry.Value.MutationVersion, entry.Value.SynchronizationSequences);
                 }
             }
             _stream.Flush();
@@ -209,22 +228,30 @@ namespace Memory2
         public VerificationResult Verify()
         {
             var issues = new List<VerificationIssue>();
+            long original = 0;
+            bool restorePosition = false;
             try
             {
                 if (!_stream.CanSeek || !_stream.CanRead) issues.Add(new VerificationIssue("The backing stream is not readable and seekable."));
                 else if (_stream.Length > 0)
                 {
-                    long original = _stream.Position;
+                    original = _stream.Position;
+                    restorePosition = true;
                     _stream.Position = 0;
                     using (var reader = new BinaryReader(_stream, System.Text.Encoding.UTF8, true))
                     {
-                        if (reader.ReadString() != Magic) issues.Add(new VerificationIssue("The store header is invalid."));
-                        long capacity = reader.ReadInt64();
-                        if (capacity <= 0) issues.Add(new VerificationIssue("The persisted capacity is invalid."));
-                        int modulus = reader.ReadInt32();
-                        if (modulus <= 0 || (modulus & (modulus - 1)) != 0) issues.Add(new VerificationIssue("The persisted modulus is invalid."));
+                        StoreHeader header = ReadHeader(reader);
+                        for (int set = 0; set < header.SetCount; set++)
+                        {
+                            string typeName = reader.ReadString();
+                            if (string.IsNullOrWhiteSpace(typeName)) throw new InvalidDataException("A persisted set has no model type.");
+                            int count = ReadCount(reader, "record count");
+                            for (int i = 0; i < count; i++) ReadRecord(reader);
+                            ReadSynchronizationCheckpoint(reader);
+                        }
+                        if (_stream.Position != _stream.Length)
+                            issues.Add(new VerificationIssue("The store contains trailing or unread payload bytes."));
                     }
-                    _stream.Position = original;
                 }
                 foreach (object state in _sets.Values)
                 {
@@ -233,6 +260,7 @@ namespace Memory2
                 }
             }
             catch (Exception ex) { issues.Add(new VerificationIssue(ex.Message)); }
+            finally { if (restorePosition) _stream.Position = original; }
             return new VerificationResult(issues);
         }
 
@@ -255,16 +283,15 @@ namespace Memory2
             _stream.Position = 0;
             using (var reader = new BinaryReader(_stream, System.Text.Encoding.UTF8, true))
             {
-                if (reader.ReadString() != Magic) throw new InvalidDataException("The stream is not a Memory2 store.");
-                reader.ReadInt64(); reader.ReadInt32();
-                int setCount = reader.ReadInt32();
-                for (int s = 0; s < setCount; s++)
+                StoreHeader header = ReadHeader(reader);
+                for (int s = 0; s < header.SetCount; s++)
                 {
                     string typeName = reader.ReadString();
-                    int count = reader.ReadInt32();
+                    int count = ReadCount(reader, "record count");
                     var records = new List<Dictionary<string, object>>(count);
                     for (int i = 0; i < count; i++) records.Add(ReadRecord(reader));
-                    _pending[typeName] = records;
+                    PendingSynchronizationState synchronization = ReadSynchronizationCheckpoint(reader);
+                    _pending[typeName] = new PendingSetState(records, synchronization.MutationVersion, synchronization.Sequences);
                 }
             }
             _stream.Position = original;
@@ -284,10 +311,111 @@ namespace Memory2
 
         private static Dictionary<string, object> ReadRecord(BinaryReader reader)
         {
-            int count = reader.ReadInt32();
+            int count = ReadCount(reader, "property count");
             var record = new Dictionary<string, object>(count, StringComparer.Ordinal);
             for (int i = 0; i < count; i++) record[reader.ReadString()] = ReadValue(reader);
             return record;
+        }
+
+        private static void WriteRecord(BinaryWriter writer, Dictionary<string, object> record)
+        {
+            writer.Write(record.Count);
+            foreach (KeyValuePair<string, object> pair in record.OrderBy(x => x.Key, StringComparer.Ordinal))
+            {
+                writer.Write(pair.Key);
+                WriteValue(writer, pair.Value, pair.Value?.GetType() ?? typeof(object));
+            }
+        }
+
+        private static void WriteSynchronizationCheckpoint(BinaryWriter writer, object set)
+        {
+            Type type = set.GetType();
+            long mutationVersion = (long)type.GetMethod("SnapshotMutationVersion", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(set, null);
+            var sequences = (KeyValuePair<string, long>[])type.GetMethod("SnapshotSynchronizationSequences", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(set, null);
+            WriteSynchronizationCheckpoint(writer, mutationVersion, sequences);
+        }
+
+        private static void WriteSynchronizationCheckpoint(BinaryWriter writer, long mutationVersion, IReadOnlyList<KeyValuePair<string, long>> sequences)
+        {
+            writer.Write(mutationVersion);
+            writer.Write(sequences.Count);
+            for (int i = 0; i < sequences.Count; i++)
+            {
+                writer.Write(sequences[i].Key);
+                writer.Write(sequences[i].Value);
+            }
+        }
+
+        private static PendingSynchronizationState ReadSynchronizationCheckpoint(BinaryReader reader)
+        {
+            long mutationVersion = reader.ReadInt64();
+            if (mutationVersion < 0) throw new InvalidDataException("The persisted mutation version is invalid.");
+            int count = ReadCount(reader, "synchronization source count");
+            var sequences = new KeyValuePair<string, long>[count];
+            var origins = new HashSet<string>(StringComparer.Ordinal);
+            for (int i = 0; i < count; i++)
+            {
+                string origin = reader.ReadString();
+                long sequence = reader.ReadInt64();
+                if (string.IsNullOrWhiteSpace(origin) || sequence <= 0 || !origins.Add(origin))
+                    throw new InvalidDataException("A persisted synchronization checkpoint is invalid.");
+                sequences[i] = new KeyValuePair<string, long>(origin, sequence);
+            }
+            return new PendingSynchronizationState(mutationVersion, sequences);
+        }
+
+        private static void WriteHeader(BinaryWriter writer, int modulus, int setCount)
+        {
+            writer.Write(Magic);
+            writer.Write(FormatVersion);
+            writer.Write(MaximumPopulation);
+            writer.Write(modulus);
+            writer.Write(setCount);
+        }
+
+        private static StoreHeader ReadHeader(BinaryReader reader)
+        {
+            if (reader.ReadString() != Magic) throw new InvalidDataException("The stream is not a supported Memory2 store.");
+            int version = reader.ReadInt32();
+            if (version != FormatVersion) throw new InvalidDataException("Unsupported Memory2 store version: " + version + ".");
+            long capacity = reader.ReadInt64();
+            if (capacity != MaximumPopulation) throw new InvalidDataException("The persisted coordinate capacity is incompatible with this build.");
+            int modulus = reader.ReadInt32();
+            StableIdentity.ValidatePowerOfTwoModulus(modulus, "persisted modulus");
+            int setCount = ReadCount(reader, "set count");
+            return new StoreHeader(modulus, setCount);
+        }
+
+        private static int ReadCount(BinaryReader reader, string description)
+        {
+            int count = reader.ReadInt32();
+            if (count < 0 || count > MaximumSerializedCollectionCount)
+                throw new InvalidDataException("Invalid persisted " + description + ": " + count + ".");
+            return count;
+        }
+
+        private readonly struct StoreHeader
+        {
+            internal StoreHeader(int modulus, int setCount) { Modulus = modulus; SetCount = setCount; }
+            internal readonly int Modulus;
+            internal readonly int SetCount;
+        }
+
+        private sealed class PendingSetState
+        {
+            internal PendingSetState(List<Dictionary<string, object>> records, long mutationVersion, KeyValuePair<string, long>[] synchronizationSequences)
+            { Records = records; MutationVersion = mutationVersion; SynchronizationSequences = synchronizationSequences; }
+            internal readonly List<Dictionary<string, object>> Records;
+            internal readonly long MutationVersion;
+            internal readonly KeyValuePair<string, long>[] SynchronizationSequences;
+        }
+
+        private readonly struct PendingSynchronizationState
+        {
+            internal PendingSynchronizationState(long mutationVersion, KeyValuePair<string, long>[] sequences)
+            { MutationVersion = mutationVersion; Sequences = sequences; }
+            internal readonly long MutationVersion;
+            internal readonly KeyValuePair<string, long>[] Sequences;
         }
 
         internal static bool IsSupported(Type type) => GraphObject.IsScalar(type);
@@ -373,21 +501,21 @@ namespace Memory2
                 case 11: return DateTime.FromBinary(reader.ReadInt64());
                 case 12: return new DateTimeOffset(reader.ReadInt64(), new TimeSpan(reader.ReadInt64()));
                 case 13: return new TimeSpan(reader.ReadInt64());
-                case 14: return new Guid(reader.ReadBytes(16));
-                case 15: return reader.ReadBytes(reader.ReadInt32());
+                case 14: return new Guid(ReadExactBytes(reader, 16));
+                case 15: return ReadExactBytes(reader, ReadCount(reader, "byte-array length"));
                 case 16:
                 {
-                    int count=reader.ReadInt32(); Array a=Array.CreateInstance(t.GetElementType(), count);
+                    int count=ReadCount(reader, "array length"); Array a=Array.CreateInstance(t.GetElementType(), count);
                     for(int i=0;i<count;i++) a.SetValue(ReadValue(reader), i); return a;
                 }
                 case 17:
                 {
-                    int count=reader.ReadInt32(); IList list=(IList)Activator.CreateInstance(t);
+                    int count=ReadCount(reader, "list length"); IList list=(IList)Activator.CreateInstance(t);
                     for(int i=0;i<count;i++) list.Add(ReadValue(reader)); return list;
                 }
                 case 18:
                 {
-                    int count=reader.ReadInt32(); IDictionary d=(IDictionary)Activator.CreateInstance(t);
+                    int count=ReadCount(reader, "dictionary length"); IDictionary d=(IDictionary)Activator.CreateInstance(t);
                     for(int i=0;i<count;i++) d.Add(ReadValue(reader), ReadValue(reader)); return d;
                 }
                 case 19:
@@ -398,12 +526,19 @@ namespace Memory2
                 }
                 case 26:
                 {
-                    int count=reader.ReadInt32(); object collection=Activator.CreateInstance(t); MethodInfo add=t.GetMethod("Add");
+                    int count=ReadCount(reader, "collection length"); object collection=Activator.CreateInstance(t); MethodInfo add=t.GetMethod("Add");
                     if(add==null) throw new InvalidDataException("Collection type has no Add method: "+t.FullName);
                     for(int i=0;i<count;i++) add.Invoke(collection,new[]{ReadValue(reader)}); return collection;
                 }
                 default: throw new InvalidDataException("Unknown Memory2 value tag: " + tag);
             }
+        }
+
+        private static byte[] ReadExactBytes(BinaryReader reader, int count)
+        {
+            byte[] bytes = reader.ReadBytes(count);
+            if (bytes.Length != count) throw new EndOfStreamException("The Memory2 store ended inside a binary value.");
+            return bytes;
         }
 
         internal sealed class ReferenceEqualityComparer : IEqualityComparer<object>

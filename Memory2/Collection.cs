@@ -1,6 +1,3 @@
-// File: Memory2/Collection.cs  (CHANGED / FULL FILE)
-// Adds Collection<T>.AddCommit(Commit).
-
 using System;
 using System.Collections.Generic;
 using System.Linq.Expressions;
@@ -80,6 +77,17 @@ namespace Memory2
             return new PreparedAt<T>(this, terms, options);
         }
 
+        /// <summary>Begins a query-only relational AT plan; no per-record relation state is stored.</summary>
+        public AtRelationQuery<T> Relations() => new AtRelationQuery<T>(this);
+
+        /// <summary>Prepares a single finite relation over one generated axis.</summary>
+        public PreparedAtRelation<T> PrepareAtRelation<TValue>(
+            Expression<Func<T, TValue>> axis,
+            TValue center,
+            AtRelation<TValue> relation,
+            AtQueryOptions options = default(AtQueryOptions))
+            => Relations().Related(axis, center, relation).Prepare(options);
+
         public T GetAt(Expression<Func<T, bool>> atPredicate, AtQueryOptions options = default(AtQueryOptions))
         {
             if (atPredicate == null) throw new ArgumentNullException(nameof(atPredicate));
@@ -106,6 +114,14 @@ namespace Memory2
         public SynchronizationResult ApplySynchronization(SynchronizationEnvelope<T> envelope)
             => _engine.ApplySynchronization(envelope);
 
+        internal KeyValuePair<string, long>[] SnapshotSynchronizationSequences()
+            => _engine.SnapshotSynchronizationSequences<T>();
+
+        internal long SnapshotMutationVersion() => _engine.MutationVersion<T>();
+
+        internal void RestoreSynchronizationState(IReadOnlyList<KeyValuePair<string, long>> sequences, long mutationVersion)
+            => _engine.RestoreSynchronizationState<T>(sequences, mutationVersion);
+
         public IReadOnlyList<SynchronizationResult> ApplySynchronizationBatch(IReadOnlyList<SynchronizationEnvelope<T>> envelopes)
         {
             if (envelopes == null) throw new ArgumentNullException(nameof(envelopes));
@@ -114,7 +130,7 @@ namespace Memory2
             return results;
         }
 
-        // --------- NEW: AddCommit plumbing ---------
+        /// <summary>Adds an immutable history commit to the native surface index.</summary>
         public void AddCommit(Commit commit) => _engine.AddCommit<T>(commit);
     }
 }

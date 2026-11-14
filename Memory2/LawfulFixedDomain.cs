@@ -44,8 +44,18 @@ namespace Memory2
 
         public int ExcludePrefix(int endExclusive)
         {
+            if (endExclusive < 0) throw new ArgumentOutOfRangeException(nameof(endExclusive));
             if (endExclusive <= _deletedPrefixExclusive) return 0;
             int previous = _deletedPrefixExclusive;
+            int newlyExcluded = endExclusive - previous;
+            for (int i = 0; i < _excluded.Count; i++)
+            {
+                RootInterval interval = _excluded[i];
+                if (interval.Start >= endExclusive) break;
+                int overlapStart = Math.Max(previous, interval.Start);
+                int overlapEnd = Math.Min(endExclusive, interval.EndExclusive);
+                if (overlapEnd > overlapStart) newlyExcluded -= overlapEnd - overlapStart;
+            }
             _deletedPrefixExclusive = endExclusive;
             while (_excluded.Count != 0 && _excluded[0].EndExclusive <= endExclusive) _excluded.RemoveAt(0);
             if (_excluded.Count != 0 && _excluded[0].Start < endExclusive)
@@ -54,26 +64,32 @@ namespace Memory2
                 _excluded[0] = new RootInterval(endExclusive, overlap.EndExclusive);
             }
             unchecked { _epoch++; }
-            return endExclusive - previous;
+            return newlyExcluded;
         }
 
         public int ExcludeRange(int start, int count)
         {
+            if (start < 0) throw new ArgumentOutOfRangeException(nameof(start));
             if (count <= 0) return 0;
             int end = checked(start + count);
             if (start <= _deletedPrefixExclusive) return ExcludePrefix(Math.Max(_deletedPrefixExclusive, end));
             int insert = 0;
             while (insert < _excluded.Count && _excluded[insert].EndExclusive < start) insert++;
             int mergedStart = start, mergedEnd = end;
+            int newlyExcluded = count;
             while (insert < _excluded.Count && _excluded[insert].Start <= mergedEnd)
             {
-                mergedStart = Math.Min(mergedStart, _excluded[insert].Start);
-                mergedEnd = Math.Max(mergedEnd, _excluded[insert].EndExclusive);
+                RootInterval overlap = _excluded[insert];
+                int overlapStart = Math.Max(start, overlap.Start);
+                int overlapEnd = Math.Min(end, overlap.EndExclusive);
+                if (overlapEnd > overlapStart) newlyExcluded -= overlapEnd - overlapStart;
+                mergedStart = Math.Min(mergedStart, overlap.Start);
+                mergedEnd = Math.Max(mergedEnd, overlap.EndExclusive);
                 _excluded.RemoveAt(insert);
             }
             _excluded.Insert(insert, new RootInterval(mergedStart, mergedEnd));
             unchecked { _epoch++; }
-            return count;
+            return newlyExcluded;
         }
 
         public void Include(int rootIndex)
@@ -102,6 +118,35 @@ namespace Memory2
                 writer.Write(_excluded[i].Start);
                 writer.Write(_excluded[i].EndExclusive);
             }
+        }
+
+        internal void Read(BinaryReader reader, int rootCount)
+        {
+            if (reader == null) throw new ArgumentNullException(nameof(reader));
+            uint epoch = reader.ReadUInt32();
+            int deletedPrefixExclusive = reader.ReadInt32();
+            int count = reader.ReadInt32();
+            if (deletedPrefixExclusive < 0 || deletedPrefixExclusive > rootCount)
+                throw new InvalidDataException("The persisted deleted-root prefix is outside the root domain.");
+            if (count < 0 || count > rootCount)
+                throw new InvalidDataException("The persisted root-exclusion count is invalid.");
+
+            var intervals = new System.Collections.Generic.List<RootInterval>(count);
+            int previousEnd = deletedPrefixExclusive;
+            for (int i = 0; i < count; i++)
+            {
+                int start = reader.ReadInt32();
+                int endExclusive = reader.ReadInt32();
+                if (start < previousEnd || endExclusive <= start || endExclusive > rootCount)
+                    throw new InvalidDataException("The persisted root-exclusion intervals are invalid.");
+                intervals.Add(new RootInterval(start, endExclusive));
+                previousEnd = endExclusive;
+            }
+
+            _epoch = epoch == 0 ? 1u : epoch;
+            _deletedPrefixExclusive = deletedPrefixExclusive;
+            _excluded.Clear();
+            _excluded.AddRange(intervals);
         }
 
         private readonly struct RootInterval

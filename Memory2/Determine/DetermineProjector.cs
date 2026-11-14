@@ -6,7 +6,7 @@ namespace Memory2.Determine
     internal sealed class DeterministicProjector<T> where T : class, new()
     {
         private readonly DetermineSchema _schema;
-        private readonly AlethigraphUniverse _u;
+        private readonly AlethigraphUniverse _universe;
 
         // Cache Id property once per closed generic type
         private static readonly PropertyInfo _idProp = typeof(T).GetProperty("Id", BindingFlags.Public | BindingFlags.Instance);
@@ -14,7 +14,7 @@ namespace Memory2.Determine
         public DeterministicProjector(DetermineSchema schema, AlethigraphUniverse universe)
         {
             _schema = schema ?? throw new ArgumentNullException(nameof(schema));
-            _u = universe ?? throw new ArgumentNullException(nameof(universe));
+            _universe = universe ?? throw new ArgumentNullException(nameof(universe));
         }
 
         public T DetermineBase(long id)
@@ -24,17 +24,8 @@ namespace Memory2.Determine
             for (int i = 0; i < _schema.AxisCount; i++)
             {
                 var axis = _schema.GetAxis(i);
-                int baseCode = axis.CodeFromId(id);
-                int codeToUse = baseCode;
-
-                if (axis.PropertyType == typeof(int) && string.Equals(axis.Name, "Score", StringComparison.OrdinalIgnoreCase))
-                {
-                    int startNode = baseCode % _u.RingSize;
-                    uint reveal = _u.EffectiveReveal32(startNode, step: 0);
-                    codeToUse = (int)(reveal & (uint)(_schema.Modulus - 1));
-                }
-
-                object value = DetermineValue(axis, codeToUse);
+                int code = _universe.TransformCode(axis.CodeFromId(id), _schema.Modulus);
+                object value = DetermineValue(axis, code);
                 axis.Setter(obj, value);
             }
 
@@ -79,13 +70,7 @@ namespace Memory2.Determine
         internal TValue DetermineAxisValue<TValue>(long id, int axisIndex)
         {
             DetermineSchema.Axis axis = _schema.GetAxis(axisIndex);
-            int code = axis.CodeFromId(id);
-            if (axis.PropertyType == typeof(int) && string.Equals(axis.Name, "Score", StringComparison.OrdinalIgnoreCase))
-            {
-                int startNode = code % _u.RingSize;
-                uint reveal = _u.EffectiveReveal32(startNode, step: 0);
-                code = (int)(reveal & (uint)(_schema.Modulus - 1));
-            }
+            int code = _universe.TransformCode(axis.CodeFromId(id), _schema.Modulus);
             if (typeof(TValue) == typeof(int)) return (TValue)(object)code;
             if (typeof(TValue) == typeof(bool)) return (TValue)(object)((code & 1) != 0);
             if (typeof(TValue) == typeof(long)) return (TValue)(object)(long)(uint)code;
@@ -100,14 +85,59 @@ namespace Memory2.Determine
         internal object DetermineAxisValue(long id, int axisIndex)
         {
             DetermineSchema.Axis axis = _schema.GetAxis(axisIndex);
-            int code = axis.CodeFromId(id);
-            if (axis.PropertyType == typeof(int) && string.Equals(axis.Name, "Score", StringComparison.OrdinalIgnoreCase))
-            {
-                int startNode = code % _u.RingSize;
-                uint reveal = _u.EffectiveReveal32(startNode, step: 0);
-                code = (int)(reveal & (uint)(_schema.Modulus - 1));
-            }
+            int code = _universe.TransformCode(axis.CodeFromId(id), _schema.Modulus);
             return DetermineValue(axis, code);
+        }
+
+        /// <summary>
+        /// Encodes a generated axis directly from its deterministic code. All codecs
+        /// accepted by DetermineSchema have a canonical generated representation, so
+        /// relation verification need not allocate and populate a model instance.
+        /// </summary>
+        internal bool TryEncodeGeneratedAxisValue(long id, int axisIndex, out int code, out int fingerprint)
+        {
+            DetermineSchema.Axis axis = _schema.GetAxis(axisIndex);
+            int generatedCode = _universe.TransformCode(axis.CodeFromId(id), _schema.Modulus);
+            Type type = axis.PropertyType;
+
+            if (type == typeof(bool))
+            {
+                code = generatedCode & 1;
+                fingerprint = code;
+                return true;
+            }
+            if (type == typeof(short))
+            {
+                int value = unchecked((short)generatedCode);
+                code = PositiveMod(value, axis.Modulus);
+                fingerprint = value;
+                return true;
+            }
+            if (type == typeof(byte))
+            {
+                int value = unchecked((byte)generatedCode);
+                code = value % axis.Modulus;
+                fingerprint = value;
+                return true;
+            }
+            if (type == typeof(int) || type == typeof(uint) || type == typeof(ushort) ||
+                type == typeof(long) || type == typeof(ulong) || type == typeof(string) ||
+                (type.IsEnum && axis.CanSolveUniqueResidue))
+            {
+                code = generatedCode;
+                fingerprint = generatedCode;
+                return true;
+            }
+
+            code = 0;
+            fingerprint = 0;
+            return false;
+        }
+
+        private static int PositiveMod(int value, int modulus)
+        {
+            int result = value % modulus;
+            return result < 0 ? result + modulus : result;
         }
 
         internal static object DetermineValue(DetermineSchema.Axis axis, int code)
@@ -115,11 +145,11 @@ namespace Memory2.Determine
             Type t = axis.PropertyType;
 
             // --- Common integral types ---
-            if (t == typeof(int) || t == typeof(short) || t == typeof(byte) ||
-                t == typeof(uint) || t == typeof(ushort))
-            {
-                return Convert.ChangeType(code, t);
-            }
+            if (t == typeof(int)) return code;
+            if (t == typeof(short)) return unchecked((short)code);
+            if (t == typeof(byte)) return unchecked((byte)code);
+            if (t == typeof(uint)) return unchecked((uint)code);
+            if (t == typeof(ushort)) return unchecked((ushort)code);
 
             if (t == typeof(sbyte))
             {

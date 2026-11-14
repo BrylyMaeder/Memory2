@@ -176,7 +176,7 @@ namespace Memory2.Tests
             };
             store.Set().CreateMany(batch);
 
-            EngineeringRecord point = store.Set().GetRequired(2048);
+            EngineeringRecord point = store.Set().Load(2048);
             point.Score++;
             store.Save(point);
 

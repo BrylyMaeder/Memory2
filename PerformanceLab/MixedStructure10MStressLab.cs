@@ -113,7 +113,7 @@ internal static class MixedStructure10MStressLab
 
         ForceGc();
         long beforeMemory = GC.GetTotalMemory(true);
-        string? persistencePath = logicalTarget >= 100_000_000L
+        string persistencePath = logicalTarget >= 100_000_000L
             ? Path.Combine(Path.GetTempPath(), "Memory2-scale-" + logicalTarget.ToString() + ".m2")
             : null;
         using Stream stream = persistencePath == null

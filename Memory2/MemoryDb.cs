@@ -1,6 +1,3 @@
-// File: Memory2/MemoryDb.cs  (CHANGED / FULL FILE)
-// Adds ApplyEpoch(s) API (if you don't already have it) and keeps Create signature.
-
 using System;
 using System.Linq.Expressions;
 

@@ -82,7 +82,8 @@ namespace Memory2.Determine
                 StableIdentity.CreateAffineCoefficients(p.Name, modulus, out a, out b);
                 int invA = ModInversePow2(a, modulus);
 
-                axes.Add(new Axis(p.Name, p.PropertyType, codec, getter, setter, a, b, invA, modulus));
+                axes.Add(new Axis(p.Name, p.PropertyType, codec, getter, setter, a, b, invA, modulus,
+                    CanRepresentEveryCode(p.PropertyType, modulus)));
             }
 
             var schema = new DetermineSchema
@@ -106,6 +107,16 @@ namespace Memory2.Determine
             string xd = x.DeclaringType == null ? string.Empty : x.DeclaringType.FullName;
             string yd = y.DeclaringType == null ? string.Empty : y.DeclaringType.FullName;
             return StringComparer.Ordinal.Compare(xd, yd);
+        }
+
+        private static bool CanRepresentEveryCode(Type type, int modulus)
+        {
+            if (type == typeof(bool)) return false;
+            if (type.IsEnum) type = Enum.GetUnderlyingType(type);
+            if (type == typeof(byte)) return modulus <= 256;
+            if (type == typeof(short)) return modulus <= 32_768;
+            if (type == typeof(ushort)) return modulus <= 65_536;
+            return true;
         }
 
         private static int ModInversePow2(int a, int modulus)
@@ -153,6 +164,7 @@ namespace Memory2.Determine
             public readonly int B;
             public readonly int InvA;
             public readonly int Modulus;
+            public readonly bool CanSolveUniqueResidue;
 
             public Axis(
                 string name,
@@ -163,7 +175,8 @@ namespace Memory2.Determine
                 int a,
                 int b,
                 int invA,
-                int modulus)
+                int modulus,
+                bool canSolveUniqueResidue)
             {
                 Name = name;
                 PropertyType = propertyType;
@@ -174,6 +187,7 @@ namespace Memory2.Determine
                 B = b;
                 InvA = invA;
                 Modulus = modulus;
+                CanSolveUniqueResidue = canSolveUniqueResidue;
             }
 
             public object Getter(object obj) => _getter(obj);

@@ -1,6 +1,7 @@
 ﻿// File: Memory2/Determine/Universe.cs  (NEW)
 using System;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace Memory2.Determine
 {
@@ -12,9 +13,11 @@ namespace Memory2.Determine
     {
         private readonly Node[] _nodes;
         private readonly int[][] _nbrs;
+        private int _codeMask;
 
         public int RingSize { get; }
         public int NodeCount => RingSize;
+        internal int CodeMask => Volatile.Read(ref _codeMask);
 
         public long TotalTouchCount
         {
@@ -105,7 +108,16 @@ namespace Memory2.Determine
                 _nodes[i].XorFold ^= v;
                 _nodes[i].SumFold += v;
             }
+
+            // XOR is deliberately used here: it is its own inverse, so an epoch can
+            // alter every generated axis while AT can still solve a literal back to
+            // the original affine coordinate without maintaining an index.
+            uint mask = (uint)SplitMix64(epoch ^ _nodes[(int)(epoch % (ulong)RingSize)].Scar32());
+            Volatile.Write(ref _codeMask, unchecked((int)(mask | 1U)));
         }
+
+        internal int TransformCode(int code, int modulus)
+            => (code ^ (CodeMask & (modulus - 1))) & (modulus - 1);
 
         public uint Reveal32(int nodeId, int step)
         {

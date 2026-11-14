@@ -1,14 +1,3 @@
-// File: Memory2/At/AtSolver.cs
-// FULL CLASS (drop-in replacement) — matches your CURRENT codec + AtExplain surface.
-//
-// Fixes compilation errors by:
-// - Using IAtAxisCodec.TryEncodeLiteral(object, out int code, out int fingerprint32)
-// - Using IAtAxisCodec.TryEncodeValue(object, out int code, out int fingerprint32)
-// - NOT referencing AtExplain.HeaderBytes / AtExplain.ExpectedHeaderProbes (since your AtExplain lacks them)
-//
-// Keeps the *actual solver fix*:
-// - GenerateIds() enumerates ONLY the congruence class using correct first+stride math.
-
 using System;
 using System.Collections.Generic;
 using Memory2.Determine;
@@ -19,218 +8,348 @@ namespace Memory2.At
     {
         internal sealed class Plan
         {
-            private readonly long _pop;
+            private readonly long _population;
             private readonly long _start;
             private readonly long _endExclusive;
-
             private readonly int _modulus;
-            private readonly int? _residue;
+            private readonly int[] _residues;
+            private readonly ulong[] _residueWords;
 
             internal readonly ExpectedTerm[] Expected;
             internal readonly bool IsEmpty;
+            internal readonly bool GeneratedCandidatesAreExact;
             public readonly AtExplain Explain;
 
-            public Plan(
-                long pop,
-                long start,
-                long endExclusive,
-                int modulus,
-                int? residue,
-                ExpectedTerm[] expected,
-                bool isEmpty,
-                AtExplain explain)
+            internal Plan(long population, long start, long endExclusive, int modulus, int[] residues,
+                ExpectedTerm[] expected, bool isEmpty, bool generatedCandidatesAreExact, AtExplain explain)
             {
-                _pop = pop;
+                _population = population;
                 _start = start;
                 _endExclusive = endExclusive;
                 _modulus = modulus;
-                _residue = residue;
-
-                Expected = expected ?? new ExpectedTerm[0];
+                _residues = residues;
+                Expected = expected ?? Array.Empty<ExpectedTerm>();
                 IsEmpty = isEmpty;
+                GeneratedCandidatesAreExact = generatedCandidatesAreExact;
                 Explain = explain;
+                if (residues != null && residues.Length > 1)
+                {
+                    _residueWords = new ulong[(modulus + 63) >> 6];
+                    for (int i = 0; i < residues.Length; i++)
+                        _residueWords[residues[i] >> 6] |= 1UL << (residues[i] & 63);
+                }
             }
 
-            public IEnumerable<long> GenerateIds()
+            internal IEnumerable<long> GenerateIds() => GenerateIds(null, null);
+
+            internal IEnumerable<long> GenerateIds(long? startInclusive, long? endExclusive)
             {
-                if (IsEmpty) yield break;
-
-                long start = _start;
-                long end = _endExclusive;
-
-                if (start < 0) start = 0;
-                if (end > _pop) end = _pop;
-                if (end <= start) yield break;
-
-                // No residue => scan narrowed range (bounded by start/end)
-                if (_residue.HasValue == false)
+                Clamp(startInclusive, endExclusive, out long start, out long end);
+                if (IsEmpty || end <= start) yield break;
+                if (_residues == null)
                 {
-                    for (long id = start; id < end; id++)
+                    for (long id = start; id < end; id++) yield return id;
+                    yield break;
+                }
+                if (_residues.Length == 1)
+                {
+                    long first = FirstAtOrAfter(start, _residues[0]);
+                    for (long id = first; id < end;)
+                    {
                         yield return id;
+                        if (id > long.MaxValue - _modulus) yield break;
+                        id += _modulus;
+                    }
                     yield break;
                 }
 
-                int M = _modulus;
-                int r = _residue.Value;
+                long block = start - (start % _modulus);
+                while (block < end)
+                {
+                    for (int i = 0; i < _residues.Length; i++)
+                    {
+                        long id = block + _residues[i];
+                        if (id < start) continue;
+                        if (id >= end) break;
+                        yield return id;
+                    }
+                    if (block > long.MaxValue - _modulus) yield break;
+                    block += _modulus;
+                }
+            }
 
-                // first id >= start such that id % M == r
-                long sMod = start % M;
-                if (sMod < 0) sMod += M;
+            internal bool Generates(long id)
+            {
+                if (IsEmpty || id < 0 || id >= _population || id < _start || id >= _endExclusive) return false;
+                if (_residues == null) return true;
+                int residue = (int)(id % _modulus);
+                if (_residues.Length == 1) return residue == _residues[0];
+                return (_residueWords[residue >> 6] & (1UL << (residue & 63))) != 0;
+            }
 
-                long delta = r - sMod;
-                delta %= M;
-                if (delta < 0) delta += M;
+            internal long CountGeneratedIds(long startInclusive, long endExclusive)
+            {
+                Clamp(startInclusive, endExclusive, out long start, out long end);
+                if (IsEmpty || end <= start) return 0;
+                if (_residues == null) return end - start;
+                long count = 0;
+                for (int i = 0; i < _residues.Length; i++) count = checked(count + CountResidue(start, end, _residues[i]));
+                return count;
+            }
 
-                long first = start + delta;
+            internal long ChecksumGeneratedIds(long startInclusive, long endExclusive)
+            {
+                Clamp(startInclusive, endExclusive, out long start, out long end);
+                if (IsEmpty || end <= start) return 0;
+                if (_residues == null) return SumProgression(start, end - start, 1);
+                long checksum = 0;
+                for (int i = 0; i < _residues.Length; i++)
+                {
+                    long first = FirstAtOrAfter(start, _residues[i]);
+                    if (first >= end) continue;
+                    long count = 1L + (end - 1L - first) / _modulus;
+                    checksum = unchecked(checksum + SumProgression(first, count, _modulus));
+                }
+                return checksum;
+            }
 
-                for (long id = first; id < end; id += M)
-                    yield return id;
+            internal long FirstGeneratedId(long startInclusive, long endExclusive)
+            {
+                Clamp(startInclusive, endExclusive, out long start, out long end);
+                if (IsEmpty || end <= start) return -1;
+                if (_residues == null) return start;
+                long best = long.MaxValue;
+                for (int i = 0; i < _residues.Length; i++)
+                {
+                    long candidate = FirstAtOrAfter(start, _residues[i]);
+                    if (candidate < best) best = candidate;
+                }
+                return best < end ? best : -1;
+            }
+
+            private void Clamp(long? requestedStart, long? requestedEnd, out long start, out long end)
+            {
+                start = _start;
+                end = _endExclusive;
+                if (requestedStart.HasValue && requestedStart.Value > start) start = requestedStart.Value;
+                if (requestedEnd.HasValue && requestedEnd.Value < end) end = requestedEnd.Value;
+                if (start < 0) start = 0;
+                if (end > _population) end = _population;
+            }
+
+            private long FirstAtOrAfter(long start, int residue)
+            {
+                long remainder = start % _modulus;
+                long delta = residue - remainder;
+                if (delta < 0) delta += _modulus;
+                return start + delta;
+            }
+
+            private long CountResidue(long start, long end, int residue)
+            {
+                long first = FirstAtOrAfter(start, residue);
+                return first >= end ? 0 : 1L + (end - 1L - first) / _modulus;
+            }
+
+            private static long SumProgression(long first, long count, long step)
+            {
+                if (count <= 0) return 0;
+                long triangular = (count & 1L) == 0
+                    ? unchecked((count >> 1) * (count - 1L))
+                    : unchecked(count * ((count - 1L) >> 1));
+                return unchecked(count * first + step * triangular);
             }
         }
 
-        internal struct ExpectedTerm
+        internal readonly struct ExpectedValue
         {
-            public int AxisIndex;
-            public int ExpectedCode;
-            public int ExpectedFingerprint;
-            public string AxisName;
+            internal ExpectedValue(int code, int fingerprint) { Code = code; Fingerprint = fingerprint; }
+            internal int Code { get; }
+            internal int Fingerprint { get; }
+        }
 
-            public ExpectedTerm(int axisIndex, int code, int fp, string axisName)
+        internal readonly struct ExpectedTerm
+        {
+            internal ExpectedTerm(int axisIndex, string axisName, ExpectedValue[] alternatives)
             {
                 AxisIndex = axisIndex;
-                ExpectedCode = code;
-                ExpectedFingerprint = fp;
-                AxisName = axisName ?? "";
+                AxisName = axisName ?? string.Empty;
+                Alternatives = alternatives ?? Array.Empty<ExpectedValue>();
+                PackedAlternatives = new long[Alternatives.Length];
+                for (int i = 0; i < Alternatives.Length; i++)
+                    PackedAlternatives[i] = Pack(Alternatives[i].Code, Alternatives[i].Fingerprint);
+                Array.Sort(PackedAlternatives);
             }
+            internal int AxisIndex { get; }
+            internal string AxisName { get; }
+            internal ExpectedValue[] Alternatives { get; }
+            private long[] PackedAlternatives { get; }
+
+            internal bool Matches(int code, int fingerprint)
+            {
+                long target = Pack(code, fingerprint);
+                long[] values = PackedAlternatives;
+                int low = 0, high = values.Length - 1;
+                while (low <= high)
+                {
+                    int middle = low + ((high - low) >> 1);
+                    long value = values[middle];
+                    if (value == target) return true;
+                    if (value < target) low = middle + 1;
+                    else high = middle - 1;
+                }
+                return false;
+            }
+
+            private static long Pack(int code, int fingerprint)
+                => unchecked(((long)(uint)code << 32) | (uint)fingerprint);
         }
 
-        public static Plan Compile(
-            DetermineSchema schema,
-            long population,
-            IReadOnlyList<(string Axis, object Value)> terms,
-            AtQueryOptions options)
+        internal static Plan Compile(DetermineSchema schema, long population,
+            IReadOnlyList<(string Axis, object Value)> terms, AtQueryOptions options, int epochCodeMask = 0)
+        {
+            if (terms == null) throw new ArgumentNullException(nameof(terms));
+            var constraints = new AtConstraintTerm[terms.Count];
+            for (int i = 0; i < terms.Count; i++) constraints[i] = AtConstraintTerm.Exact(terms[i].Axis, terms[i].Value);
+            return Compile(schema, population, constraints, options, epochCodeMask, null);
+        }
+
+        internal static Plan Compile(DetermineSchema schema, long population,
+            IReadOnlyList<AtConstraintTerm> terms, AtQueryOptions options, int epochCodeMask,
+            Func<int, int, int, bool> generatedValueMatches)
         {
             if (schema == null) throw new ArgumentNullException(nameof(schema));
             if (terms == null) throw new ArgumentNullException(nameof(terms));
             if (population < 0) population = 0;
 
             int modulus = schema.Modulus;
-            long start = 0;
-            long endExclusive = population;
-
-            int supplied = terms.Count;
-
-            var encodedNames = new List<string>(Math.Max(4, supplied));
-            var droppedNames = new List<string>(0);
-            var expected = new List<ExpectedTerm>(Math.Max(4, supplied));
-
-            bool isEmpty = false;
-
-            int? residue = null;
+            var encodedNames = new List<string>(Math.Max(4, terms.Count));
+            var droppedNames = new List<string>();
+            var expected = new List<ExpectedTerm>(Math.Max(4, terms.Count));
+            bool[] permittedResidues = null;
+            bool isGeneratedEmpty = false;
+            bool generatedCandidatesAreExact = true;
+            int relationTermCount = 0;
 
             for (int i = 0; i < terms.Count; i++)
             {
-                string axisName = (terms[i].Axis ?? "").Trim();
-                object lit = terms[i].Value;
-
-                if (axisName.Length == 0)
+                AtConstraintTerm term = terms[i];
+                string axisName = (term.Axis ?? string.Empty).Trim();
+                if (term.IsRelation) relationTermCount++;
+                if (axisName.Length == 0 || !schema.TryGetAxisIndex(axisName, out int axisIndex))
                 {
-                    if (options.Strict) { isEmpty = true; break; }
+                    if (options.Strict)
+                    {
+                        isGeneratedEmpty = true;
+                        expected.Add(new ExpectedTerm(-1, axisName, Array.Empty<ExpectedValue>()));
+                    }
+                    else droppedNames.Add(axisName);
                     continue;
                 }
 
-                int axisIndex;
-                if (!schema.TryGetAxisIndex(axisName, out axisIndex))
+                DetermineSchema.Axis axis = schema.GetAxis(axisIndex);
+                var alternatives = new List<ExpectedValue>(term.Alternatives.Length);
+                bool[] termResidues = axis.CanSolveUniqueResidue ? new bool[modulus] : null;
+                if (!axis.CanSolveUniqueResidue) generatedCandidatesAreExact = false;
+
+                for (int alternative = 0; alternative < term.Alternatives.Length; alternative++)
                 {
-                    if (options.Strict) { isEmpty = true; break; }
-                    droppedNames.Add(axisName);
+                    object literal = term.Alternatives[alternative];
+                    if (axis.Codec == null || !axis.Codec.TryEncodeLiteral(literal, out int code, out int fingerprint))
+                    {
+                        if (options.Strict) isGeneratedEmpty = true;
+                        continue;
+                    }
+                    bool duplicate = false;
+                    for (int prior = 0; prior < alternatives.Count; prior++)
+                        if (alternatives[prior].Code == code && alternatives[prior].Fingerprint == fingerprint)
+                        { duplicate = true; break; }
+                    if (duplicate) continue;
+                    alternatives.Add(new ExpectedValue(code, fingerprint));
+
+                    if (termResidues != null && (generatedValueMatches == null || generatedValueMatches(axisIndex, code, fingerprint)))
+                    {
+                        int generatedCode = code ^ (epochCodeMask & (modulus - 1));
+                        termResidues[axis.SolveResidueFromCode(generatedCode)] = true;
+                    }
+                }
+
+                if (alternatives.Count == 0)
+                {
+                    if (options.Strict || term.Alternatives.Length == 0)
+                    {
+                        expected.Add(new ExpectedTerm(axisIndex, axisName, Array.Empty<ExpectedValue>()));
+                        isGeneratedEmpty = true;
+                    }
+                    else droppedNames.Add(axisName);
                     continue;
                 }
 
-                var axis = schema.GetAxis(axisIndex);
-
-                int code = 0;
-                int fp = 0;
-
-                // IMPORTANT: your codec requires fingerprint32 out-param
-                if (axis.Codec == null || !axis.Codec.TryEncodeLiteral(lit, out code, out fp))
+                encodedNames.Add(term.IsRelation ? axisName + "[" + term.RelationName + "]" : axisName);
+                expected.Add(new ExpectedTerm(axisIndex, axisName, alternatives.ToArray()));
+                if (termResidues == null) continue;
+                if (permittedResidues == null) permittedResidues = termResidues;
+                else
                 {
-                    if (options.Strict) { isEmpty = true; break; }
-                    droppedNames.Add(axisName);
-                    continue;
-                }
-
-                encodedNames.Add(axisName);
-                expected.Add(new ExpectedTerm(axisIndex, code, fp, axisName));
-
-                // Solvable residue for this axis (must match how projector determines that axis)
-                int r = axis.SolveResidueFromCode(code);
-
-                if (!residue.HasValue) residue = r;
-                else if (residue.Value != r)
-                {
-                    // Contradiction: no IDs satisfy all solvable equalities
-                    isEmpty = true;
-                    break;
+                    bool any = false;
+                    for (int residue = 0; residue < modulus; residue++)
+                    {
+                        permittedResidues[residue] &= termResidues[residue];
+                        any |= permittedResidues[residue];
+                    }
+                    if (!any) isGeneratedEmpty = true;
                 }
             }
+
+            int[] residues = null;
+            if (permittedResidues != null)
+            {
+                var values = new List<int>();
+                for (int residue = 0; residue < permittedResidues.Length; residue++)
+                    if (permittedResidues[residue]) values.Add(residue);
+                residues = values.ToArray();
+                if (residues.Length == 0) isGeneratedEmpty = true;
+            }
+            if (expected.Count == 0) generatedCandidatesAreExact = false;
 
             var explain = new AtExplain
             {
                 ModelType = schema.ModelType,
-                Population = (population > int.MaxValue) ? int.MaxValue : (int)population,
+                Population = population,
                 Modulus = modulus,
-                Residue = residue.HasValue ? residue.Value : 0,
-                SuppliedTermCount = supplied,
+                Residue = residues != null && residues.Length == 1 ? residues[0] : -1,
+                ResidueCount = residues?.Length ?? modulus,
+                RelationTermCount = relationTermCount,
+                SuppliedTermCount = terms.Count,
                 EncodedTermCount = encodedNames.Count,
                 DroppedTermCount = droppedNames.Count,
                 DroppedTerms = droppedNames.ToArray(),
                 EncodedTerms = encodedNames.ToArray()
             };
-
-            return new Plan(
-                pop: population,
-                start: start,
-                endExclusive: endExclusive,
-                modulus: modulus,
-                residue: residue,
-                expected: expected.ToArray(),
-                isEmpty: isEmpty,
-                explain: explain);
+            var plan = new Plan(population, 0, population, modulus, residues, expected.ToArray(),
+                isGeneratedEmpty, generatedCandidatesAreExact, explain);
+            explain.ExpectedProbes = plan.CountGeneratedIds(0, population);
+            return plan;
         }
 
-        public static bool MatchesAllTerms(
-            DetermineSchema schema,
-            object obj,
-            IReadOnlyList<(string Axis, object Value)> originalTerms,
-            ExpectedTerm[] expected)
+        internal static bool MatchesAllTerms(DetermineSchema schema, object obj, ExpectedTerm[] expected)
         {
-            if (schema == null) return false;
-            if (obj == null) return false;
+            if (schema == null || obj == null) return false;
             if (expected == null) return true;
-
             for (int i = 0; i < expected.Length; i++)
             {
-                var e = expected[i];
-                var axis = schema.GetAxis(e.AxisIndex);
-
-                object got = axis.Getter(obj);
-
-                int gotCode = 0;
-                int gotFp = 0;
-
-                if (axis.Codec == null || !axis.Codec.TryEncodeValue(got, out gotCode, out gotFp))
-                    return false;
-
-                if (gotCode != e.ExpectedCode)
-                    return false;
-
-                // Fingerprint is optional but we do compare it since your codec provides it.
-                if (gotFp != e.ExpectedFingerprint)
-                    return false;
+                ExpectedTerm term = expected[i];
+                if (term.AxisIndex < 0 || term.Alternatives.Length == 0) return false;
+                DetermineSchema.Axis axis = schema.GetAxis(term.AxisIndex);
+                object actual = axis.Getter(obj);
+                if (axis.Codec == null || !axis.Codec.TryEncodeValue(actual, out int code, out int fingerprint)) return false;
+                if (!term.Matches(code, fingerprint)) return false;
             }
-
             return true;
         }
+
+        internal static bool MatchesAllTerms(DetermineSchema schema, object obj,
+            IReadOnlyList<(string Axis, object Value)> originalTerms, ExpectedTerm[] expected)
+            => MatchesAllTerms(schema, obj, expected);
     }
 }

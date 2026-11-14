@@ -89,7 +89,6 @@ namespace Memory2
         private readonly Dictionary<string, List<Node>> _byRoot = new Dictionary<string, List<Node>>(StringComparer.Ordinal);
         private readonly Dictionary<Type, List<Node>> _byType = new Dictionary<Type, List<Node>>();
         private readonly ConditionalWeakTable<object, MaterializedGraphIdentity> _returned = new ConditionalWeakTable<object, MaterializedGraphIdentity>();
-        private long _nextNodeId = 1;
         private long _directWrites;
         private long _rootRewritesAvoided;
         private long _materializations;

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using Memory2.At;
 using Memory2.Determine;
 
 namespace Memory2.History
@@ -121,6 +122,85 @@ namespace Memory2.History
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Encodes a compact patched value without first materializing a model object.
+        /// <paramref name="found"/> distinguishes an untouched axis from a fallback
+        /// transform whose affected axes cannot be inspected safely.
+        /// </summary>
+        internal bool TryEncodeAxisValue(int axisIndex, out int code, out int fingerprint, out bool found)
+        {
+            code = 0;
+            fingerprint = 0;
+            found = false;
+            if (_fallback != null)
+            {
+                found = true;
+                return false;
+            }
+
+            for (int i = 0; i < _axisIndices.Length; i++)
+            {
+                if (_axisIndices[i] != axisIndex) continue;
+                found = true;
+                DetermineSchema.Axis axis = _schema.GetAxis(axisIndex);
+                switch ((PatchValueKind)_kinds[i])
+                {
+                    case PatchValueKind.Int32:
+                    {
+                        int value = unchecked((int)_numbers[i]);
+                        code = PositiveMod(value, axis.Modulus);
+                        fingerprint = value;
+                        return true;
+                    }
+                    case PatchValueKind.Int64:
+                    {
+                        long value = _numbers[i];
+                        int low = unchecked((int)value);
+                        code = PositiveMod(low, axis.Modulus);
+                        fingerprint = low ^ unchecked((int)(value >> 32));
+                        return true;
+                    }
+                    case PatchValueKind.Boolean:
+                        code = _numbers[i] == 0 ? 0 : 1;
+                        fingerprint = code;
+                        return true;
+                    case PatchValueKind.Enum:
+                    {
+                        // Enum codecs use the low Int32 representation. Fall back to
+                        // the codec for an exotic enum value that cannot be represented.
+                        long raw = _numbers[i];
+                        if (raw >= int.MinValue && raw <= int.MaxValue)
+                        {
+                            int value = (int)raw;
+                            code = PositiveMod(value, axis.Modulus);
+                            fingerprint = value;
+                            return true;
+                        }
+                        return axis.Codec != null && axis.Codec.TryEncodeValue(
+                            Enum.ToObject(axis.PropertyType, raw), out code, out fingerprint);
+                    }
+                    case PatchValueKind.String:
+                        return axis.Codec != null && axis.Codec.TryEncodeValue(_strings[i], out code, out fingerprint);
+                    case PatchValueKind.GeneratedString:
+                    {
+                        // This uncommon path may allocate the reconstructed value; numeric
+                        // and boolean patches, which dominate relation reconciliation, do not.
+                        string value = _strings[i] + _numbers[i].ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        return axis.Codec != null && axis.Codec.TryEncodeValue(value, out code, out fingerprint);
+                    }
+                    default:
+                        return axis.Codec != null && axis.Codec.TryEncodeValue(_objects[i], out code, out fingerprint);
+                }
+            }
+            return false;
+        }
+
+        private static int PositiveMod(int value, int modulus)
+        {
+            int result = value % modulus;
+            return result < 0 ? result + modulus : result;
         }
 
         public void ApplyToObject(object obj)
@@ -248,7 +328,11 @@ namespace Memory2.History
         private sealed class PageBlock { internal readonly PatchPage[] Pages = new PatchPage[PagesPerBlock]; }
         private readonly long _population;
         private readonly ConcurrentDictionary<long, PageBlock> _blocks = new ConcurrentDictionary<long, PageBlock>();
+        private readonly ConcurrentDictionary<long, byte> _patchedIds = new ConcurrentDictionary<long, byte>();
         private readonly object[] _owners = new object[4096];
+        private readonly object _snapshotOwner = new object();
+        private long[] _patchedIdSnapshot = Array.Empty<long>();
+        private long _patchedIdVersion, _snapshotVersion = -1;
         private long _patchCount, _fieldValueCount, _framesPublished, _pageContacts, _shadowCancellations, _allocatedPages, _densePages, _payloadBytes;
 
         internal PagedPointPatchStore(long population) { _population = population < 1 ? 1 : population; for (int i = 0; i < _owners.Length; i++) _owners[i] = new object(); }
@@ -281,7 +365,7 @@ namespace Memory2.History
                 {
                     int slot=(int)(items[j].Id&PageMask); PointPatchShadow before; PatchPage promoted=page.Set(slot,items[j].Patch,out before);
                     if(promoted!=null) { page=block.Pages[pageOffset]=promoted; Interlocked.Increment(ref _densePages); }
-                    Account(before,items[j].Patch);
+                    Account(items[j].Id,before,items[j].Patch);
                 }
                 Interlocked.Increment(ref _pageContacts);
             }
@@ -301,27 +385,53 @@ namespace Memory2.History
         }
         internal IEnumerable<long> EnumeratePatchedIds()
         {
-            foreach (var blockPair in _blocks)
+            long[] snapshot = GetPatchedIdSnapshot();
+            for (int i = 0; i < snapshot.Length; i++) yield return snapshot[i];
+        }
+        internal long[] GetPatchedIdSnapshot()
+        {
+            long version = Volatile.Read(ref _patchedIdVersion);
+            long[] snapshot = Volatile.Read(ref _patchedIdSnapshot);
+            if (Volatile.Read(ref _snapshotVersion) == version) return snapshot;
+            lock (_snapshotOwner)
             {
-                long blockBasePage = blockPair.Key << BlockPageShift;
-                PageBlock block = blockPair.Value;
-                for (int pageOffset = 0; pageOffset < block.Pages.Length; pageOffset++)
+                version = Volatile.Read(ref _patchedIdVersion);
+                if (_snapshotVersion == version) return _patchedIdSnapshot;
+                snapshot = new long[_patchedIds.Count];
+                int count = 0;
+                foreach (KeyValuePair<long, byte> item in _patchedIds)
                 {
-                    PatchPage page = Volatile.Read(ref block.Pages[pageOffset]);
-                    if (page == null || page.Count == 0) continue;
-                    long pageBase = (blockBasePage + pageOffset) << PageShift;
-                    for (int slot = 0; slot < PageSize; slot++) if (page.Get(slot) != null) yield return pageBase + slot;
+                    if (count == snapshot.Length) Array.Resize(ref snapshot, count + 1);
+                    snapshot[count++] = item.Key;
                 }
+                if (count != snapshot.Length) Array.Resize(ref snapshot, count);
+                Array.Sort(snapshot);
+                Volatile.Write(ref _patchedIdSnapshot, snapshot);
+                Volatile.Write(ref _snapshotVersion, version);
+                return snapshot;
             }
         }
+        internal long Count => Interlocked.Read(ref _patchCount);
         internal SurfaceMillStatistics GetStatistics()
         {
             long pageBytes=0; foreach(var b in _blocks.Values) for(int i=0;i<b.Pages.Length;i++){var p=b.Pages[i]; if(p!=null)pageBytes+=p.EstimatedBytes;}
             return new SurfaceMillStatistics(Interlocked.Read(ref _patchCount),Interlocked.Read(ref _fieldValueCount),Interlocked.Read(ref _allocatedPages),Interlocked.Read(ref _densePages),Interlocked.Read(ref _framesPublished),Interlocked.Read(ref _pageContacts),Interlocked.Read(ref _shadowCancellations),_blocks.Count,PageSize,PagesPerBlock,pageBytes,Interlocked.Read(ref _payloadBytes));
         }
-        private void Account(PointPatchShadow before, PointPatchShadow after)
+        private void Account(long id, PointPatchShadow before, PointPatchShadow after)
         {
-            if(before==null&&after!=null)Interlocked.Increment(ref _patchCount); else if(before!=null&&after==null){Interlocked.Decrement(ref _patchCount);Interlocked.Increment(ref _shadowCancellations);}
+            if(before==null&&after!=null)
+            {
+                _patchedIds.TryAdd(id, 0);
+                Interlocked.Increment(ref _patchedIdVersion);
+                Interlocked.Increment(ref _patchCount);
+            }
+            else if(before!=null&&after==null)
+            {
+                _patchedIds.TryRemove(id, out _);
+                Interlocked.Increment(ref _patchedIdVersion);
+                Interlocked.Decrement(ref _patchCount);
+                Interlocked.Increment(ref _shadowCancellations);
+            }
             if(before!=null){Interlocked.Add(ref _fieldValueCount,-before.FieldCount);Interlocked.Add(ref _payloadBytes,-before.EstimatedPayloadBytes);}
             if(after!=null){Interlocked.Add(ref _fieldValueCount,after.FieldCount);Interlocked.Add(ref _payloadBytes,after.EstimatedPayloadBytes);}
         }

@@ -1,6 +1,3 @@
-// File: Memory2/Engine.cs  (CHANGED / FULL FILE)
-// Adds Engine.AddCommit<T>(Commit) so Collection<T> can expose it.
-
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -10,6 +7,11 @@ using Memory2.History;
 
 namespace Memory2
 {
+    internal interface IEpochAwareTable
+    {
+        void OnEpochApplied();
+    }
+
     internal sealed partial class Engine
     {
         private readonly long _population;
@@ -34,16 +36,18 @@ namespace Memory2
         public int Modulus => _modulus;
         public long Population => _population;
 
-        public void ApplyEpoch(ulong epoch) => _universe.ApplyEpoch(epoch);
+        public void ApplyEpoch(ulong epoch)
+        {
+            _universe.ApplyEpoch(epoch);
+            foreach (object table in _tables.Values)
+                ((IEpochAwareTable)table).OnEpochApplied();
+        }
 
         internal Table<T> GetTable<T>() where T : class, new()
         {
-            object t;
-            if (_tables.TryGetValue(typeof(T), out t)) return (Table<T>)t;
-
-            var created = new Table<T>(_population, _modulus, _universe);
-            _tables.TryAdd(typeof(T), created);
-            return created;
+            return (Table<T>)_tables.GetOrAdd(
+                typeof(T),
+                _ => new Table<T>(_population, _modulus, _universe));
         }
 
         public void Upsert<T>(T model, long id) where T : class, new()
@@ -90,7 +94,6 @@ namespace Memory2
 
         internal long MutationVersion<T>() where T : class, new() => GetTable<T>().MutationVersion;
 
-        // --------- NEW: AddCommit plumbing ---------
         public void AddCommit<T>(Commit commit) where T : class, new()
         {
             if (commit == null) throw new ArgumentNullException(nameof(commit));
@@ -103,6 +106,12 @@ namespace Memory2
 
         internal SynchronizationResult ApplySynchronization<T>(SynchronizationEnvelope<T> envelope) where T : class, new()
             => GetTable<T>().ApplySynchronization(envelope);
+
+        internal KeyValuePair<string, long>[] SnapshotSynchronizationSequences<T>() where T : class, new()
+            => GetTable<T>().SnapshotSynchronizationSequences();
+
+        internal void RestoreSynchronizationState<T>(IReadOnlyList<KeyValuePair<string, long>> sequences, long mutationVersion) where T : class, new()
+            => GetTable<T>().RestoreSynchronizationState(sequences, mutationVersion);
 
         public CollectionStatistics GetStatistics<T>() where T : class, new()
         {

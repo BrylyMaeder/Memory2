@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Threading;
 
 namespace Memory2
 {
@@ -12,8 +13,11 @@ namespace Memory2
         private readonly Collection<T> _collection;
         private readonly SortedDictionary<long, T> _records = new SortedDictionary<long, T>();
         private readonly PropertyInfo _idProperty;
-        private readonly PropertyInfo[] _copyProperties;
+        private readonly object _subscriptionGate = new object();
+        private SubscriptionRegistration<T>[] _subscriptions = Array.Empty<SubscriptionRegistration<T>>();
         private long _nextId = 1;
+        private long _nextSubscriptionToken;
+        private long _subscriptionEvents;
 
         internal MemorySet(MemoryStore store, Collection<T> collection)
         {
@@ -23,9 +27,6 @@ namespace Memory2
             if (_idProperty == null || _idProperty.PropertyType != typeof(long) || !_idProperty.CanRead || !_idProperty.CanWrite)
                 throw new InvalidOperationException(typeof(T).Name + " must expose public long Id { get; set; }.");
 
-            _copyProperties = typeof(T).GetProperties(BindingFlags.Instance | BindingFlags.Public)
-                .Where(p => p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0)
-                .ToArray();
         }
 
         public long Count => _records.Count;
@@ -50,6 +51,8 @@ namespace Memory2
             if (model == null) throw new ArgumentNullException(nameof(model));
             long id = (long)_idProperty.GetValue(model, null);
             ValidateId(id, nameof(model));
+            SubscriptionRegistration<T>[] subscriptions = Volatile.Read(ref _subscriptions);
+            T before = subscriptions.Length == 0 ? null : Get(id);
 
             // The application-facing facade retains the exact POCO state, including
             // property types that are not algebraic axes (for example decimal). The
@@ -60,6 +63,7 @@ namespace Memory2
             _records[id] = graph ? (T)GraphObject.CloneScalars(model) : Clone(model);
             _store.ReplaceOwnedGraph(typeof(T), id, model);
             if (id >= _nextId) _nextId = id + 1;
+            if (subscriptions.Length != 0) PublishSubscriptionChanges(id, before, Get(id), subscriptions);
         }
 
         public void UpsertMany(IEnumerable<T> models)
@@ -70,6 +74,14 @@ namespace Memory2
             {
                 long id = (long)_idProperty.GetValue(model, null);
                 ValidateId(id, nameof(models));
+            }
+
+            // Preserve exact per-write transition semantics when observers are present.
+            // The normal observer-free path remains a single native batch operation.
+            if (Volatile.Read(ref _subscriptions).Length != 0)
+            {
+                foreach (T model in materialized) Upsert(model);
+                return;
             }
 
             _collection.UpsertMany(materialized);
@@ -103,8 +115,11 @@ namespace Memory2
 
         public bool Delete(long id)
         {
+            SubscriptionRegistration<T>[] subscriptions = Volatile.Read(ref _subscriptions);
+            T before = subscriptions.Length == 0 ? null : Get(id);
             bool removed = _records.Remove(id);
             if (removed) _store.RemoveOwnedGraph(typeof(T), id);
+            if (removed && subscriptions.Length != 0) PublishSubscriptionChanges(id, before, null, subscriptions);
             return removed;
         }
 
@@ -126,22 +141,44 @@ namespace Memory2
         public IQueryable<T> Query() => All().AsQueryable();
 
         public MemorySubscription Subscribe(Func<T, bool> predicate, Action<SubscriptionChange<T>> handler)
-            => _collection.Subscribe(predicate, handler);
+        {
+            if (predicate == null) throw new ArgumentNullException(nameof(predicate));
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            long token = Interlocked.Increment(ref _nextSubscriptionToken);
+            var registration = new SubscriptionRegistration<T>(token, predicate, handler);
+            lock (_subscriptionGate)
+            {
+                SubscriptionRegistration<T>[] current = _subscriptions;
+                var next = new SubscriptionRegistration<T>[current.Length + 1];
+                Array.Copy(current, next, current.Length);
+                next[current.Length] = registration;
+                Volatile.Write(ref _subscriptions, next);
+            }
+            return new MemorySubscription(() => Unsubscribe(token));
+        }
 
         public SynchronizationResult ApplySynchronization(SynchronizationEnvelope<T> envelope)
         {
+            if (envelope == null) throw new ArgumentNullException(nameof(envelope));
+            SubscriptionRegistration<T>[] subscriptions = Volatile.Read(ref _subscriptions);
+            T before = subscriptions.Length == 0 ? null : Get(envelope.Id);
             SynchronizationResult result = _collection.ApplySynchronization(envelope);
-            if (result.Status == SynchronizationStatus.Applied || result.Status == SynchronizationStatus.AlreadyApplied)
+            if (result.Status == SynchronizationStatus.Applied)
             {
                 bool graph = GraphShape.For(typeof(T)).HasRelationships;
                 _records[envelope.Id] = graph ? (T)GraphObject.CloneScalars(envelope.Model) : Clone(envelope.Model);
                 _store.ReplaceOwnedGraph(typeof(T), envelope.Id, envelope.Model);
                 if (envelope.Id >= _nextId) _nextId = envelope.Id + 1;
+                if (subscriptions.Length != 0)
+                    PublishSubscriptionChanges(envelope.Id, before, Get(envelope.Id), subscriptions);
             }
             return result;
         }
 
-        public CollectionStatistics GetStatistics() => _collection.GetStatistics();
+        public CollectionStatistics GetStatistics()
+            => _collection.GetStatistics().WithSubscriptionOverlay(
+                Volatile.Read(ref _subscriptions).Length,
+                Interlocked.Read(ref _subscriptionEvents));
 
         internal IEnumerable<object> SnapshotObjects()
         {
@@ -151,6 +188,14 @@ namespace Memory2
                 if (model != null) yield return model;
             }
         }
+
+        internal KeyValuePair<string, long>[] SnapshotSynchronizationSequences()
+            => _collection.SnapshotSynchronizationSequences();
+
+        internal long SnapshotMutationVersion() => _collection.SnapshotMutationVersion();
+
+        internal void RestoreSynchronizationState(IReadOnlyList<KeyValuePair<string, long>> sequences, long mutationVersion)
+            => _collection.RestoreSynchronizationState(sequences, mutationVersion);
 
         internal void LoadRecord(Dictionary<string, object> record)
         {
@@ -172,6 +217,37 @@ namespace Memory2
         private T Clone(T source)
         {
             return source == null ? null : _store.DeepClone(source);
+        }
+
+        private void Unsubscribe(long token)
+        {
+            lock (_subscriptionGate)
+            {
+                SubscriptionRegistration<T>[] current = _subscriptions;
+                int found = Array.FindIndex(current, x => x.Token == token);
+                if (found < 0) return;
+                var next = new SubscriptionRegistration<T>[current.Length - 1];
+                if (found > 0) Array.Copy(current, 0, next, 0, found);
+                if (found + 1 < current.Length)
+                    Array.Copy(current, found + 1, next, found, current.Length - found - 1);
+                Volatile.Write(ref _subscriptions, next);
+            }
+        }
+
+        private void PublishSubscriptionChanges(long id, T before, T after, SubscriptionRegistration<T>[] subscriptions)
+        {
+            for (int i = 0; i < subscriptions.Length; i++)
+            {
+                SubscriptionRegistration<T> subscription = subscriptions[i];
+                bool oldMatch = before != null && subscription.Predicate(before);
+                bool newMatch = after != null && subscription.Predicate(after);
+                if (!oldMatch && !newMatch) continue;
+                SubscriptionChangeKind kind = !oldMatch
+                    ? SubscriptionChangeKind.Entered
+                    : !newMatch ? SubscriptionChangeKind.Left : SubscriptionChangeKind.Updated;
+                subscription.Handler(new SubscriptionChange<T>(id, kind, before, after));
+                Interlocked.Increment(ref _subscriptionEvents);
+            }
         }
     }
 }

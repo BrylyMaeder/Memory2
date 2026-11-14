@@ -32,10 +32,12 @@ namespace Memory2
         private readonly LawfulMemoryStore<TRoot> _store;
         private readonly LawfulNodeShape _shape;
         private readonly int[] _coordinates;
+        private readonly int _contiguousStart;
+        private readonly int _count;
         private readonly LawfulQueryDiagnostics _diagnostics;
 
-        private LawfulNodeQuery(LawfulMemoryStore<TRoot> store, LawfulNodeShape shape, int[] coordinates, LawfulQueryDiagnostics diagnostics)
-        { _store = store; _shape = shape; _coordinates = coordinates; _diagnostics = diagnostics; }
+        private LawfulNodeQuery(LawfulMemoryStore<TRoot> store, LawfulNodeShape shape, int[] coordinates, int contiguousStart, int count, LawfulQueryDiagnostics diagnostics)
+        { _store = store; _shape = shape; _coordinates = coordinates; _contiguousStart = contiguousStart; _count = count; _diagnostics = diagnostics; }
 
         internal static LawfulNodeQuery<TRoot, TNode> Create(LawfulMemoryStore<TRoot> store)
         {
@@ -43,6 +45,9 @@ namespace Memory2
             int roots = store.QueryRootCount;
             int live = 0;
             for (int root = 0; root < roots; root++) if (store.IsQueryRootVisible(root)) live++;
+            var diagnostics = new LawfulQueryDiagnostics();
+            if (live == roots)
+                return new LawfulNodeQuery<TRoot, TNode>(store, shape, null, 0, checked(roots * shape.ItemsPerRoot), diagnostics);
             int[] coordinates = new int[checked(live * shape.ItemsPerRoot)];
             int output = 0;
             for (int root = 0; root < roots; root++)
@@ -51,19 +56,19 @@ namespace Memory2
                 int first = root * shape.ItemsPerRoot;
                 for (int local = 0; local < shape.ItemsPerRoot; local++) coordinates[output++] = first + local;
             }
-            return new LawfulNodeQuery<TRoot, TNode>(store, shape, coordinates, new LawfulQueryDiagnostics());
+            return new LawfulNodeQuery<TRoot, TNode>(store, shape, coordinates, 0, coordinates.Length, diagnostics);
         }
 
         public LawfulQueryDiagnostics Diagnostics => _diagnostics;
-        public int Count => _coordinates.Length;
+        public int Count => _count;
 
         /// <summary>Fully materializes every query result, including all configured owned descendants.</summary>
         public TNode[] Hydrate()
         {
-            var models = new TNode[_coordinates.Length];
+            var models = new TNode[_count];
             for (int i = 0; i < models.Length; i++)
             {
-                models[i] = _store.HydrateCoordinate<TNode>(_shape, _coordinates[i]);
+                models[i] = _store.HydrateCoordinate<TNode>(_shape, CoordinateAt(i));
                 _diagnostics.ModelMaterializations++;
             }
             return models;
@@ -72,8 +77,8 @@ namespace Memory2
         /// <summary>Fully materializes the result at the specified query position.</summary>
         public TNode HydrateAt(int index)
         {
-            if ((uint)index >= (uint)_coordinates.Length) throw new ArgumentOutOfRangeException(nameof(index));
-            TNode model = _store.HydrateCoordinate<TNode>(_shape, _coordinates[index]);
+            if ((uint)index >= (uint)_count) throw new ArgumentOutOfRangeException(nameof(index));
+            TNode model = _store.HydrateCoordinate<TNode>(_shape, CoordinateAt(index));
             _diagnostics.ModelMaterializations++;
             return model;
         }
@@ -81,73 +86,74 @@ namespace Memory2
         /// <summary>Fully materializes the first query result.</summary>
         public TNode FirstHydrated()
         {
-            if (_coordinates.Length == 0) throw new InvalidOperationException("Sequence contains no elements.");
+            if (_count == 0) throw new InvalidOperationException("Sequence contains no elements.");
             return HydrateAt(0);
         }
 
         /// <summary>Fully materializes the first query result, or returns null when the sequence is empty.</summary>
         public TNode FirstOrDefaultHydrated()
-            => _coordinates.Length == 0 ? null : HydrateAt(0);
+            => _count == 0 ? null : HydrateAt(0);
 
         /// <summary>Fully materializes the last query result.</summary>
         public TNode LastHydrated()
         {
-            if (_coordinates.Length == 0) throw new InvalidOperationException("Sequence contains no elements.");
-            return HydrateAt(_coordinates.Length - 1);
+            if (_count == 0) throw new InvalidOperationException("Sequence contains no elements.");
+            return HydrateAt(_count - 1);
         }
 
         /// <summary>Fully materializes the last query result, or returns null when the sequence is empty.</summary>
         public TNode LastOrDefaultHydrated()
-            => _coordinates.Length == 0 ? null : HydrateAt(_coordinates.Length - 1);
+            => _count == 0 ? null : HydrateAt(_count - 1);
 
         /// <summary>Fully materializes the only query result.</summary>
         public TNode SingleHydrated()
         {
-            if (_coordinates.Length == 0) throw new InvalidOperationException("Sequence contains no elements.");
-            if (_coordinates.Length != 1) throw new InvalidOperationException("Sequence contains more than one element.");
+            if (_count == 0) throw new InvalidOperationException("Sequence contains no elements.");
+            if (_count != 1) throw new InvalidOperationException("Sequence contains more than one element.");
             return HydrateAt(0);
         }
 
         /// <summary>Fully materializes the only query result, or returns null when the sequence is empty.</summary>
         public TNode SingleOrDefaultHydrated()
         {
-            if (_coordinates.Length > 1) throw new InvalidOperationException("Sequence contains more than one element.");
-            return _coordinates.Length == 0 ? null : HydrateAt(0);
+            if (_count > 1) throw new InvalidOperationException("Sequence contains more than one element.");
+            return _count == 0 ? null : HydrateAt(0);
         }
 
         public LawfulPreparedNodeCountPlan<TRoot, TNode, TResult> PrepareWhereSelectCount<TResult>(Expression<Func<TNode, bool>> predicate, Expression<Func<TNode, TResult>> selector)
         {
             if (predicate == null) throw new ArgumentNullException(nameof(predicate));
             if (selector == null) throw new ArgumentNullException(nameof(selector));
-            return new LawfulPreparedNodeCountPlan<TRoot, TNode, TResult>(_coordinates, _store.CompileQuerySelector(_shape, predicate), _store.CompileQuerySelector(_shape, selector), _diagnostics);
+            return new LawfulPreparedNodeCountPlan<TRoot, TNode, TResult>(_coordinates, _contiguousStart, _count, _store.CompileQuerySelector(_shape, predicate), _store.CompileQuerySelector(_shape, selector), _diagnostics);
         }
 
         public LawfulNodeQuery<TRoot, TNode> Where(Expression<Func<TNode, bool>> predicate)
         {
             if (predicate == null) throw new ArgumentNullException(nameof(predicate));
             Func<int, bool> test = _store.CompileQuerySelector(_shape, predicate);
-            int[] scratch = new int[_coordinates.Length];
+            int[] scratch = new int[_count];
             int output = 0;
-            for (int i = 0; i < _coordinates.Length; i++)
+            for (int i = 0; i < _count; i++)
             {
                 _diagnostics.CoordinateVisits++;
                 _diagnostics.PredicateEvaluations++;
-                if (test(_coordinates[i])) scratch[output++] = _coordinates[i];
+                int coordinate = CoordinateAt(i);
+                if (test(coordinate)) scratch[output++] = coordinate;
             }
             int[] result = new int[output];
             Array.Copy(scratch, result, output);
             _diagnostics.OperatorExecutions++;
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, _diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
         }
 
         public LawfulValueQuery<TResult> Select<TResult>(Expression<Func<TNode, TResult>> selector)
         {
             if (selector == null) throw new ArgumentNullException(nameof(selector));
             Func<int, TResult> read = _store.CompileQuerySelector(_shape, selector);
-            TResult[] values = new TResult[_coordinates.Length];
+            TResult[] values = new TResult[_count];
             for (int i = 0; i < values.Length; i++)
             {
-                values[i] = read(_coordinates[i]);
+                values[i] = read(CoordinateAt(i));
                 _diagnostics.ScalarReads++;
             }
             _diagnostics.ResultValues += values.Length;
@@ -155,21 +161,21 @@ namespace Memory2
         }
 
         public bool Any()
-        { if (_coordinates.Length != 0) _diagnostics.EarlyExits++; return _coordinates.Length != 0; }
+        { if (_count != 0) _diagnostics.EarlyExits++; return _count != 0; }
 
         public bool Any(Expression<Func<TNode, bool>> predicate)
         {
             Func<int, bool> test = _store.CompileQuerySelector(_shape, predicate);
-            for (int i = 0; i < _coordinates.Length; i++)
-            { _diagnostics.PredicateEvaluations++; if (test(_coordinates[i])) { _diagnostics.EarlyExits++; return true; } }
+            for (int i = 0; i < _count; i++)
+            { _diagnostics.PredicateEvaluations++; if (test(CoordinateAt(i))) { _diagnostics.EarlyExits++; return true; } }
             return false;
         }
 
         public bool All(Expression<Func<TNode, bool>> predicate)
         {
             Func<int, bool> test = _store.CompileQuerySelector(_shape, predicate);
-            for (int i = 0; i < _coordinates.Length; i++)
-            { _diagnostics.PredicateEvaluations++; if (!test(_coordinates[i])) { _diagnostics.EarlyExits++; return false; } }
+            for (int i = 0; i < _count; i++)
+            { _diagnostics.PredicateEvaluations++; if (!test(CoordinateAt(i))) { _diagnostics.EarlyExits++; return false; } }
             return true;
         }
 
@@ -177,29 +183,33 @@ namespace Memory2
         {
             Func<int, bool> test = _store.CompileQuerySelector(_shape, predicate);
             int count = 0;
-            for (int i = 0; i < _coordinates.Length; i++) { _diagnostics.PredicateEvaluations++; if (test(_coordinates[i])) count++; }
+            for (int i = 0; i < _count; i++) { _diagnostics.PredicateEvaluations++; if (test(CoordinateAt(i))) count++; }
             return count;
         }
 
-        public LawfulNodeQuery<TRoot, TNode> Skip(int count) => Slice(count < 0 ? 0 : count, _coordinates.Length);
+        public LawfulNodeQuery<TRoot, TNode> Skip(int count) => Slice(count < 0 ? 0 : count, _count);
         public LawfulNodeQuery<TRoot, TNode> Take(int count) => Slice(0, count < 0 ? 0 : count);
-        public LawfulNodeQuery<TRoot, TNode> SkipLast(int count) => Slice(0, Math.Max(0, _coordinates.Length - Math.Max(0, count)));
-        public LawfulNodeQuery<TRoot, TNode> TakeLast(int count) => Slice(Math.Max(0, _coordinates.Length - Math.Max(0, count)), _coordinates.Length);
+        public LawfulNodeQuery<TRoot, TNode> SkipLast(int count) => Slice(0, Math.Max(0, _count - Math.Max(0, count)));
+        public LawfulNodeQuery<TRoot, TNode> TakeLast(int count) => Slice(Math.Max(0, _count - Math.Max(0, count)), _count);
         public LawfulNodeQuery<TRoot, TNode> Reverse()
         {
-            int[] result = new int[_coordinates.Length];
-            for (int i = 0; i < result.Length; i++) result[i] = _coordinates[result.Length - 1 - i];
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, _diagnostics);
+            int[] result = new int[_count];
+            for (int i = 0; i < result.Length; i++) result[i] = CoordinateAt(result.Length - 1 - i);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
         }
 
         private LawfulNodeQuery<TRoot, TNode> Slice(int start, int exclusiveEnd)
         {
-            start = Math.Min(Math.Max(0, start), _coordinates.Length);
-            exclusiveEnd = Math.Min(Math.Max(start, exclusiveEnd), _coordinates.Length);
+            start = Math.Min(Math.Max(0, start), _count);
+            exclusiveEnd = Math.Min(Math.Max(start, exclusiveEnd), _count);
+            if (_coordinates == null)
+                return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, null, _contiguousStart + start, exclusiveEnd - start, _diagnostics);
             int[] result = new int[exclusiveEnd - start];
             Array.Copy(_coordinates, start, result, 0, result.Length);
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, _diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
         }
+
+        private int CoordinateAt(int index) => _coordinates == null ? _contiguousStart + index : _coordinates[index];
     }
 
     public sealed class LawfulValueQuery<T>
@@ -470,27 +480,35 @@ namespace Memory2
         where TNode : class, new()
     {
         private readonly int[] _coordinates;
+        private readonly int _contiguousStart;
+        private readonly int _count;
         private readonly Func<int, bool> _predicate;
-        private readonly Func<int, TResult> _selector;
         private readonly LawfulQueryDiagnostics _diagnostics;
 
-        internal LawfulPreparedNodeCountPlan(int[] coordinates, Func<int, bool> predicate, Func<int, TResult> selector, LawfulQueryDiagnostics diagnostics)
-        { _coordinates = coordinates; _predicate = predicate; _selector = selector; _diagnostics = diagnostics; }
+        internal LawfulPreparedNodeCountPlan(int[] coordinates, int contiguousStart, int count, Func<int, bool> predicate, Func<int, TResult> selector, LawfulQueryDiagnostics diagnostics)
+        {
+            _coordinates = coordinates;
+            _contiguousStart = contiguousStart;
+            _count = count;
+            _predicate = predicate;
+            // Count does not observe projection values. Accept the selector to preserve
+            // the prepared API shape, but deliberately eliminate it from the terminal plan.
+            if (selector == null) throw new ArgumentNullException(nameof(selector));
+            _diagnostics = diagnostics;
+            _diagnostics.EliminatedStages++;
+        }
 
         public int ExecuteCount()
         {
             int count = 0;
-            for (int i = 0; i < _coordinates.Length; i++)
+            for (int i = 0; i < _count; i++)
             {
-                _diagnostics.CoordinateVisits++;
-                _diagnostics.PredicateEvaluations++;
-                if (!_predicate(_coordinates[i])) continue;
-                // Read the projection in the same fused pass so the compiler cannot
-                // replace the operation with predicate-only counting.
-                _selector(_coordinates[i]);
-                _diagnostics.ScalarReads++;
+                int coordinate = _coordinates == null ? _contiguousStart + i : _coordinates[i];
+                if (!_predicate(coordinate)) continue;
                 count++;
             }
+            _diagnostics.CoordinateVisits += _count;
+            _diagnostics.PredicateEvaluations += _count;
             _diagnostics.OperatorExecutions++;
             return count;
         }

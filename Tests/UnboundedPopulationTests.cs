@@ -22,7 +22,7 @@ namespace Memory2.Tests
 
             Assert.AreEqual(100, store.Count);
             Assert.IsTrue(store.AllocatedCapacity >= 100);
-            Assert.AreEqual(99L * 17L, set.GetRequired(100).Value);
+            Assert.AreEqual(99L * 17L, set.Load(100).Value);
         }
 
         [TestMethod]
@@ -35,7 +35,7 @@ namespace Memory2.Tests
             set.Create(new DynamicRecord { Value = 3 });
 
             Assert.AreEqual(3, store.Count);
-            Assert.AreEqual(3L, set.GetRequired(3).Value);
+            Assert.AreEqual(3L, set.Load(3).Value);
         }
     }
 }

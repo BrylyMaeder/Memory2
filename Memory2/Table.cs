@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,16 +13,18 @@ using Memory2.History;
 
 namespace Memory2
 {
-    internal sealed partial class Table<T> where T : class, new()
+    internal sealed partial class Table<T> : IEpochAwareTable where T : class, new()
     {
         private readonly long _population;
         private readonly DetermineSchema _schema;
         private readonly DeterministicProjector<T> _projector;
+        private readonly AlethigraphUniverse _universe;
         private readonly CommitIndex _commitIndex;
         private readonly ConcurrentDictionary<string, AtSolver.Plan> _atShadows = new ConcurrentDictionary<string, AtSolver.Plan>(StringComparer.Ordinal);
         private long _atShadowHits;
         private long _atShadowMisses;
         private long _mutationVersion;
+        private long _epochVersion;
         private readonly object _subscriptionGate = new object();
         private SubscriptionRegistration<T>[] _subscriptions = Array.Empty<SubscriptionRegistration<T>>();
         private long _nextSubscriptionToken;
@@ -46,7 +50,8 @@ namespace Memory2
             if (universe == null) throw new ArgumentNullException(nameof(universe));
             _population = population;
             _schema = DetermineSchema.For(typeof(T), modulus);
-            _projector = new DeterministicProjector<T>(_schema, universe);
+            _universe = universe;
+            _projector = new DeterministicProjector<T>(_schema, _universe);
             _commitIndex = new CommitIndex(population, modulus);
             ParallelCaptureWarmup.EnsureWarmed();
         }
@@ -206,26 +211,33 @@ namespace Memory2
         {
             if (terms == null || terms.Count == 0) throw new ArgumentException("AT requires terms.", nameof(terms));
             var plan = GetAtShadow(terms, options);
-            var examined = new HashSet<long>();
+            long first = -1;
             foreach (var id in plan.GenerateIds())
             {
-                examined.Add(id);
                 var obj = _projector.DetermineBase(id);
                 _commitIndex.ApplyToObject(id, obj);
-                if (AtSolver.MatchesAllTerms(_schema, obj, terms, plan.Expected)) return id;
+                if (AtSolver.MatchesAllTerms(_schema, obj, terms, plan.Expected)) { first = id; break; }
             }
             // Sparse exception shadows can create a match that does not exist in the generated law.
             foreach (long id in _commitIndex.EnumeratePointPatchIds())
             {
-                if (examined.Contains(id)) continue;
+                if (plan.Generates(id) || (first >= 0 && id >= first)) continue;
                 var obj = _projector.DetermineBase(id);
                 _commitIndex.ApplyToObject(id, obj);
-                if (AtSolver.MatchesAllTerms(_schema, obj, terms, plan.Expected)) return id;
+                if (AtSolver.MatchesAllTerms(_schema, obj, terms, plan.Expected)) first = id;
             }
-            return -1;
+            return first;
         }
 
-        internal long MutationVersion => System.Threading.Interlocked.Read(ref _mutationVersion);
+        internal long MutationVersion => Volatile.Read(ref _mutationVersion);
+        internal long EpochVersion => Volatile.Read(ref _epochVersion);
+
+        void IEpochAwareTable.OnEpochApplied()
+        {
+            _atShadows.Clear();
+            Interlocked.Increment(ref _epochVersion);
+            Interlocked.Increment(ref _mutationVersion);
+        }
 
         public T GetAt(IReadOnlyList<(string Axis, object Value)> terms, AtQueryOptions options)
         {
@@ -237,9 +249,34 @@ namespace Memory2
         {
             if (terms == null || terms.Count == 0) throw new ArgumentException("AT requires terms.", nameof(terms));
             var plan = GetAtShadow(terms, atOptions);
-            foreach (var id0 in plan.GenerateIds())
+            if (_commitIndex.HasNonPointCommits)
+            {
+                long scanStart = Math.Max(0, startInclusive ?? 0);
+                long scanEnd = Math.Min(_population, endExclusive ?? _population);
+                for (long id = scanStart; id < scanEnd; id++)
+                {
+                    T item = Get(id);
+                    if (!AtSolver.MatchesAllTerms(_schema, item, terms, plan.Expected)) continue;
+                    if (residualPredicate == null || residualPredicate(item)) yield return item;
+                }
+                yield break;
+            }
+            foreach (var id0 in plan.GenerateIds(startInclusive, endExclusive))
             {
                 long id = id0;
+                var obj = _projector.DetermineBase(id);
+                _commitIndex.ApplyToObject(id, obj);
+                if (!AtSolver.MatchesAllTerms(_schema, obj, terms, plan.Expected)) continue;
+                if (residualPredicate != null && !residualPredicate(obj)) continue;
+                yield return obj;
+            }
+
+            // Point patches can move a coordinate into a value class that the generated
+            // law would never nominate. They are sparse, so checking the exception set is
+            // both complete and proportional to physical mutations rather than population.
+            foreach (long id in _commitIndex.EnumeratePointPatchIds())
+            {
+                if (plan.Generates(id)) continue;
                 if (startInclusive.HasValue && id < startInclusive.Value) continue;
                 if (endExclusive.HasValue && id >= endExclusive.Value) continue;
                 var obj = _projector.DetermineBase(id);
@@ -248,6 +285,159 @@ namespace Memory2
                 if (residualPredicate != null && !residualPredicate(obj)) continue;
                 yield return obj;
             }
+        }
+
+        internal AtSolver.Plan PrepareRelation(IReadOnlyList<AtConstraintTerm> terms, AtQueryOptions options)
+            => GetRelationShadow(terms, options);
+
+        internal long ResolveFirstRelationId(AtSolver.Plan plan, long startInclusive, long? endExclusive)
+        {
+            if (plan == null) throw new ArgumentNullException(nameof(plan));
+            long end = NormalizeRelationRange(startInclusive, endExclusive ?? _population);
+            if (_commitIndex.HasNonPointCommits)
+            {
+                for (long id = startInclusive; id < end; id++) if (MatchesRelation(id, plan)) return id;
+                return -1;
+            }
+
+            long first = -1;
+            foreach (long id in plan.GenerateIds(startInclusive, end))
+            {
+                PointPatchShadow patch = _commitIndex.GetPointPatch(id);
+                if ((plan.GeneratedCandidatesAreExact && patch == null) || MatchesRelation(id, plan))
+                { first = id; break; }
+            }
+            foreach (long id in _commitIndex.EnumeratePointPatchIds())
+            {
+                if (id < startInclusive || id >= end || plan.Generates(id) || (first >= 0 && id >= first)) continue;
+                if (MatchesRelation(id, plan)) first = id;
+            }
+            return first;
+        }
+
+        internal IEnumerable<long> ResolveRelationIds(AtSolver.Plan plan, long startInclusive, long endExclusive)
+        {
+            if (plan == null) throw new ArgumentNullException(nameof(plan));
+            NormalizeRelationRange(startInclusive, endExclusive);
+            bool fastGenerated = plan.GeneratedCandidatesAreExact && !_commitIndex.HasNonPointCommits;
+            if (_commitIndex.HasNonPointCommits)
+            {
+                for (long id = startInclusive; id < endExclusive; id++)
+                    if (MatchesRelation(id, plan)) yield return id;
+                yield break;
+            }
+
+            if (fastGenerated && _commitIndex.PointPatchCount == 0)
+            {
+                foreach (long id in plan.GenerateIds(startInclusive, endExclusive)) yield return id;
+                yield break;
+            }
+
+            foreach (long id in plan.GenerateIds(startInclusive, endExclusive))
+            {
+                PointPatchShadow patch = _commitIndex.GetPointPatch(id);
+                if (fastGenerated && patch == null) yield return id;
+                else if (MatchesRelation(id, plan)) yield return id;
+            }
+            foreach (long id in _commitIndex.EnumeratePointPatchIds())
+            {
+                if (id < startInclusive || id >= endExclusive || plan.Generates(id)) continue;
+                if (MatchesRelation(id, plan)) yield return id;
+            }
+        }
+
+        internal long CountRelation(AtSolver.Plan plan, long startInclusive, long endExclusive)
+        {
+            if (plan == null) throw new ArgumentNullException(nameof(plan));
+            NormalizeRelationRange(startInclusive, endExclusive);
+            if (!plan.GeneratedCandidatesAreExact || _commitIndex.HasNonPointCommits)
+            {
+                long fallback = 0;
+                foreach (long ignored in ResolveRelationIds(plan, startInclusive, endExclusive)) fallback++;
+                return fallback;
+            }
+
+            long count = plan.CountGeneratedIds(startInclusive, endExclusive);
+            if (_commitIndex.PointPatchCount == 0) return count;
+            long[] patches = _commitIndex.GetPointPatchIdsSnapshot();
+            for (int patchIndex = 0; patchIndex < patches.Length; patchIndex++)
+            {
+                long id = patches[patchIndex];
+                if (id < startInclusive || id >= endExclusive) continue;
+                bool generatedMatch = plan.Generates(id);
+                bool patchedMatch = MatchesRelation(id, plan);
+                if (generatedMatch != patchedMatch) count += patchedMatch ? 1L : -1L;
+            }
+            return count;
+        }
+
+        internal long ChecksumRelationIds(AtSolver.Plan plan, long startInclusive, long endExclusive)
+        {
+            if (plan == null) throw new ArgumentNullException(nameof(plan));
+            NormalizeRelationRange(startInclusive, endExclusive);
+            if (!plan.GeneratedCandidatesAreExact || _commitIndex.HasNonPointCommits)
+            {
+                long fallback = 0;
+                foreach (long id in ResolveRelationIds(plan, startInclusive, endExclusive)) fallback = unchecked(fallback + id);
+                return fallback;
+            }
+
+            long checksum = plan.ChecksumGeneratedIds(startInclusive, endExclusive);
+            if (_commitIndex.PointPatchCount == 0) return checksum;
+            long[] patches = _commitIndex.GetPointPatchIdsSnapshot();
+            for (int patchIndex = 0; patchIndex < patches.Length; patchIndex++)
+            {
+                long id = patches[patchIndex];
+                if (id < startInclusive || id >= endExclusive) continue;
+                bool generatedMatch = plan.Generates(id);
+                bool patchedMatch = MatchesRelation(id, plan);
+                if (generatedMatch != patchedMatch) checksum = patchedMatch ? unchecked(checksum + id) : unchecked(checksum - id);
+            }
+            return checksum;
+        }
+
+        private bool MatchesRelation(long id, AtSolver.Plan plan)
+        {
+            PointPatchShadow patch = _commitIndex.GetPointPatch(id);
+            for (int i = 0; i < plan.Expected.Length; i++)
+            {
+                AtSolver.ExpectedTerm term = plan.Expected[i];
+                if (term.AxisIndex < 0 || term.Alternatives.Length == 0) return false;
+
+                int code, fingerprint;
+                if (patch != null)
+                {
+                    bool found;
+                    if (patch.TryEncodeAxisValue(term.AxisIndex, out code, out fingerprint, out found))
+                    {
+                        if (!term.Matches(code, fingerprint)) return false;
+                        continue;
+                    }
+                    if (found)
+                    {
+                        // Opaque legacy transforms cannot expose individual values.
+                        T materialized = _projector.DetermineBase(id);
+                        _commitIndex.ApplyToObject(id, materialized);
+                        return AtSolver.MatchesAllTerms(_schema, materialized, plan.Expected);
+                    }
+                }
+
+                if (!_projector.TryEncodeGeneratedAxisValue(id, term.AxisIndex, out code, out fingerprint))
+                {
+                    T materialized = _projector.DetermineBase(id);
+                    _commitIndex.ApplyToObject(id, materialized);
+                    return AtSolver.MatchesAllTerms(_schema, materialized, plan.Expected);
+                }
+                if (!term.Matches(code, fingerprint)) return false;
+            }
+            return true;
+        }
+
+        private long NormalizeRelationRange(long startInclusive, long endExclusive)
+        {
+            if (startInclusive < 0 || startInclusive > _population) throw new ArgumentOutOfRangeException(nameof(startInclusive));
+            if (endExclusive < startInclusive || endExclusive > _population) throw new ArgumentOutOfRangeException(nameof(endExclusive));
+            return endExclusive;
         }
 
         public void AddCommit(Commit commit)
@@ -343,6 +533,30 @@ namespace Memory2
             }
         }
 
+        internal KeyValuePair<string, long>[] SnapshotSynchronizationSequences()
+        {
+            lock (_synchronizationGate)
+                return _synchronizationSequences.OrderBy(x => x.Key, StringComparer.Ordinal).ToArray();
+        }
+
+        internal void RestoreSynchronizationState(IReadOnlyList<KeyValuePair<string, long>> sequences, long mutationVersion)
+        {
+            if (sequences == null) throw new ArgumentNullException(nameof(sequences));
+            if (mutationVersion < 0) throw new ArgumentOutOfRangeException(nameof(mutationVersion));
+            lock (_synchronizationGate)
+            {
+                _synchronizationSequences.Clear();
+                for (int i = 0; i < sequences.Count; i++)
+                {
+                    KeyValuePair<string, long> entry = sequences[i];
+                    if (string.IsNullOrWhiteSpace(entry.Key) || entry.Value <= 0)
+                        throw new InvalidDataException("A persisted synchronization checkpoint is invalid.");
+                    _synchronizationSequences.Add(entry.Key, entry.Value);
+                }
+                Volatile.Write(ref _mutationVersion, mutationVersion);
+            }
+        }
+
         public CollectionStatistics GetStatistics()
         {
             return new CollectionStatistics(_population, _schema.AxisCount, _atShadows.Count,
@@ -367,7 +581,8 @@ namespace Memory2
 
         private AtSolver.Plan GetAtShadow(IReadOnlyList<(string Axis, object Value)> terms, AtQueryOptions options)
         {
-            string key = BuildAtShadowKey(terms, options.Strict);
+            int epochCodeMask = _universe.CodeMask;
+            string key = BuildAtShadowKey(terms, options.Strict, epochCodeMask);
             AtSolver.Plan plan;
             if (_atShadows.TryGetValue(key, out plan))
             {
@@ -375,20 +590,66 @@ namespace Memory2
                 return plan;
             }
             System.Threading.Interlocked.Increment(ref _atShadowMisses);
-            plan = AtSolver.Compile(_schema, _population, terms, options);
+            plan = AtSolver.Compile(_schema, _population, terms, options, epochCodeMask);
             return _atShadows.GetOrAdd(key, plan);
         }
 
-        private static string BuildAtShadowKey(IReadOnlyList<(string Axis, object Value)> terms, bool strict)
+        private AtSolver.Plan GetRelationShadow(IReadOnlyList<AtConstraintTerm> terms, AtQueryOptions options)
+        {
+            if (terms == null || terms.Count == 0) throw new ArgumentException("Relational AT requires terms.", nameof(terms));
+            int epochCodeMask = _universe.CodeMask;
+            string key = BuildRelationShadowKey(terms, options.Strict, epochCodeMask);
+            if (_atShadows.TryGetValue(key, out AtSolver.Plan existing))
+            {
+                Interlocked.Increment(ref _atShadowHits);
+                return existing;
+            }
+            Interlocked.Increment(ref _atShadowMisses);
+            AtSolver.Plan created = AtSolver.Compile(_schema, _population, terms, options, epochCodeMask,
+                (axisIndex, code, fingerprint) => GeneratedAxisMatches(axisIndex, code, fingerprint));
+            return _atShadows.GetOrAdd(key, created);
+        }
+
+        private bool GeneratedAxisMatches(int axisIndex, int code, int fingerprint)
+        {
+            DetermineSchema.Axis axis = _schema.GetAxis(axisIndex);
+            int generatedCode = code ^ (_universe.CodeMask & (_schema.Modulus - 1));
+            int representativeResidue = axis.SolveResidueFromCode(generatedCode);
+            object value = _projector.DetermineAxisValue(representativeResidue, axisIndex);
+            return axis.Codec != null && axis.Codec.TryEncodeValue(value, out int actualCode, out int actualFingerprint) &&
+                actualCode == code && actualFingerprint == fingerprint;
+        }
+
+        private static string BuildAtShadowKey(IReadOnlyList<(string Axis, object Value)> terms, bool strict, int epochCodeMask)
         {
             var sb = new StringBuilder(32 + terms.Count * 24);
-            sb.Append(strict ? 'S' : 'L');
+            sb.Append(strict ? 'S' : 'L').Append(':').Append(epochCodeMask);
             for (int i = 0; i < terms.Count; i++)
             {
                 object value = terms[i].Value;
                 sb.Append('|').Append((terms[i].Axis ?? string.Empty).Trim().ToUpperInvariant()).Append(':');
                 if (value == null) sb.Append("<null>");
                 else sb.Append(value.GetType().FullName).Append('=').Append(Convert.ToString(value, CultureInfo.InvariantCulture));
+            }
+            return sb.ToString();
+        }
+
+        private static string BuildRelationShadowKey(IReadOnlyList<AtConstraintTerm> terms, bool strict, int epochCodeMask)
+        {
+            var sb = new StringBuilder(64 + terms.Count * 32);
+            sb.Append("REL:").Append(strict ? 'S' : 'L').Append(':').Append(epochCodeMask);
+            for (int term = 0; term < terms.Count; term++)
+            {
+                AtConstraintTerm value = terms[term];
+                sb.Append('|').Append((value.Axis ?? string.Empty).Trim().ToUpperInvariant())
+                    .Append('[').Append(value.RelationName).Append("]:");
+                for (int alternative = 0; alternative < value.Alternatives.Length; alternative++)
+                {
+                    object item = value.Alternatives[alternative];
+                    if (item == null) sb.Append("<null>");
+                    else sb.Append(item.GetType().FullName).Append('=').Append(Convert.ToString(item, CultureInfo.InvariantCulture));
+                    sb.Append(';');
+                }
             }
             return sb.ToString();
         }
@@ -445,5 +706,13 @@ namespace Memory2
             PreparedAtResultMisses = preparedAtResultMisses;
             PreparedAtResultInvalidations = preparedAtResultInvalidations;
         }
+
+        internal CollectionStatistics WithSubscriptionOverlay(int activeSubscriptions, long subscriptionEvents)
+            => new CollectionStatistics(Population, AxisCount, AtShadowCount, AtShadowHits, AtShadowMisses,
+                SurfaceMill, activeSubscriptions, subscriptionEvents, SynchronizationApplied,
+                SynchronizationReplayed, SynchronizationRejected, NativePopulationDeclarations,
+                ParallelCaptureFrames, ParallelCapturedEntities, PreparedProjectionHits,
+                PreparedProjectionMisses, PreparedProjectionInvalidations, PreparedAtResultHits,
+                PreparedAtResultMisses, PreparedAtResultInvalidations);
     }
 }

@@ -92,6 +92,7 @@ namespace Memory2.History
         }
 
         internal bool HasNonPointCommits => Volatile.Read(ref _nonPointCommitCount) != 0;
+        internal long PointPatchCount => _pointPatches.Count;
 
         internal bool TryGetPointPatchAxisValue<TValue>(long id, int axisIndex, out TValue value)
         {
@@ -115,6 +116,7 @@ namespace Memory2.History
 
         public SurfaceMillStatistics GetSurfaceMillStatistics() => _pointPatches.GetStatistics();
         internal IEnumerable<long> EnumeratePointPatchIds() => _pointPatches.EnumeratePatchedIds();
+        internal long[] GetPointPatchIdsSnapshot() => _pointPatches.GetPatchedIdSnapshot();
 
         private static bool IsPointRange(RangeIdSet range, out long id)
         {

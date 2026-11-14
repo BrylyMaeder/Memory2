@@ -3,6 +3,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <RootNamespace>Memory2</RootNamespace>
     <AssemblyName>Memory2</AssemblyName>
+    <Version>1.0.1</Version>
     <Deterministic>true</Deterministic>
     <LangVersion>10.0</LangVersion>
     <AssemblyTitle>Memory2</AssemblyTitle>

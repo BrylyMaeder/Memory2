@@ -96,7 +96,7 @@ namespace Memory2.Tests
             long id = db.Set<GraphWorld>().Create(World()).Id;
             GraphLeaf leaf = db.Query<GraphLeaf>().AsEnumerable().Single(x =>
             {
-                GraphBranch? parent = db.Parent<GraphBranch>(x);
+                GraphBranch parent = db.Parent<GraphBranch>(x);
                 return x.Code == "green" && parent != null && parent.Name == "root-branch";
             });
             leaf.Code = "emerald";

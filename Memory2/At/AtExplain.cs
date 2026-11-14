@@ -10,6 +10,8 @@ namespace Memory2.At
         public long Population { get; internal set; }
         public int Modulus { get; internal set; }
         public int Residue { get; internal set; }
+        public int ResidueCount { get; internal set; }
+        public int RelationTermCount { get; internal set; }
 
         public int SuppliedTermCount { get; internal set; }
         public int EncodedTermCount { get; internal set; }
@@ -23,7 +25,7 @@ namespace Memory2.At
         public override string ToString()
         {
             return $"AT Explain: Model={ModelType?.Name}, Terms={SuppliedTermCount}, Encoded={EncodedTermCount}, Dropped={DroppedTermCount}, " +
-                   $"M={Modulus}, r={Residue}, ExpectedProbes≈{ExpectedProbes}";
+                   $"Relations={RelationTermCount}, M={Modulus}, residues={ResidueCount}, r={Residue}, ExpectedProbes≈{ExpectedProbes}";
         }
     }
 }
