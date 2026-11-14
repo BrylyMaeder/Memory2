@@ -124,6 +124,9 @@ internal static class Program
         if (Array.Exists(args, x => string.Equals(x, "--comparative-proof", StringComparison.OrdinalIgnoreCase)))
             return ComparativeProofLab.Run(args);
 
+        if (Array.Exists(args, x => string.Equals(x, "--reactive-proof", StringComparison.OrdinalIgnoreCase)))
+            return ReactiveQueryProofLab.Run(args);
+
         PerformanceConfiguration configuration = PerformancePopulationSelector.Select();
         PerformancePopulation selectedPopulation = PerformancePopulation.OneHundredMillion;
 

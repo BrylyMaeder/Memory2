@@ -35,9 +35,15 @@ namespace Memory2
         private readonly int _contiguousStart;
         private readonly int _count;
         private readonly LawfulQueryDiagnostics _diagnostics;
+        private readonly Expression<Func<TNode, bool>> _livePredicate;
+        private readonly bool _canSubscribe;
 
-        private LawfulNodeQuery(LawfulMemoryStore<TRoot> store, LawfulNodeShape shape, int[] coordinates, int contiguousStart, int count, LawfulQueryDiagnostics diagnostics)
-        { _store = store; _shape = shape; _coordinates = coordinates; _contiguousStart = contiguousStart; _count = count; _diagnostics = diagnostics; }
+        private LawfulNodeQuery(LawfulMemoryStore<TRoot> store, LawfulNodeShape shape, int[] coordinates, int contiguousStart, int count,
+            LawfulQueryDiagnostics diagnostics, Expression<Func<TNode, bool>> livePredicate, bool canSubscribe)
+        {
+            _store = store; _shape = shape; _coordinates = coordinates; _contiguousStart = contiguousStart;
+            _count = count; _diagnostics = diagnostics; _livePredicate = livePredicate; _canSubscribe = canSubscribe;
+        }
 
         internal static LawfulNodeQuery<TRoot, TNode> Create(LawfulMemoryStore<TRoot> store)
         {
@@ -47,7 +53,7 @@ namespace Memory2
             for (int root = 0; root < roots; root++) if (store.IsQueryRootVisible(root)) live++;
             var diagnostics = new LawfulQueryDiagnostics();
             if (live == roots)
-                return new LawfulNodeQuery<TRoot, TNode>(store, shape, null, 0, checked(roots * shape.ItemsPerRoot), diagnostics);
+                return new LawfulNodeQuery<TRoot, TNode>(store, shape, null, 0, checked(roots * shape.ItemsPerRoot), diagnostics, null, true);
             int[] coordinates = new int[checked(live * shape.ItemsPerRoot)];
             int output = 0;
             for (int root = 0; root < roots; root++)
@@ -56,7 +62,7 @@ namespace Memory2
                 int first = root * shape.ItemsPerRoot;
                 for (int local = 0; local < shape.ItemsPerRoot; local++) coordinates[output++] = first + local;
             }
-            return new LawfulNodeQuery<TRoot, TNode>(store, shape, coordinates, 0, coordinates.Length, diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(store, shape, coordinates, 0, coordinates.Length, diagnostics, null, true);
         }
 
         public LawfulQueryDiagnostics Diagnostics => _diagnostics;
@@ -143,7 +149,8 @@ namespace Memory2
             int[] result = new int[output];
             Array.Copy(scratch, result, output);
             _diagnostics.OperatorExecutions++;
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics,
+                CombinePredicates(_livePredicate, predicate), _canSubscribe);
         }
 
         public LawfulValueQuery<TResult> Select<TResult>(Expression<Func<TNode, TResult>> selector)
@@ -157,7 +164,20 @@ namespace Memory2
                 _diagnostics.ScalarReads++;
             }
             _diagnostics.ResultValues += values.Length;
-            return new LawfulValueQuery<TResult>(values, _diagnostics);
+            Func<Action<LawfulQueryChange<TResult>>, IDisposable> subscribe = null;
+            if (_canSubscribe)
+                subscribe = handler => _store.SubscribeQuery(_shape, _livePredicate, selector, handler);
+            return new LawfulValueQuery<TResult>(values, _diagnostics, subscribe);
+        }
+
+        /// <summary>
+        /// Keeps this LINQ result live. The handler receives membership transitions without hydrating models.
+        /// Use Select(...).Subscribe(...) to receive projected scalar values or computations.
+        /// </summary>
+        public IDisposable Subscribe(Action<LawfulTransition> handler)
+        {
+            if (!_canSubscribe) throw new NotSupportedException("Live subscription currently supports From(...).Where(...) queries before ordering or slicing.");
+            return _store.SubscribeQuery(_shape, _livePredicate, handler);
         }
 
         public bool Any()
@@ -195,7 +215,7 @@ namespace Memory2
         {
             int[] result = new int[_count];
             for (int i = 0; i < result.Length; i++) result[i] = CoordinateAt(result.Length - 1 - i);
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics, _livePredicate, false);
         }
 
         private LawfulNodeQuery<TRoot, TNode> Slice(int start, int exclusiveEnd)
@@ -203,20 +223,40 @@ namespace Memory2
             start = Math.Min(Math.Max(0, start), _count);
             exclusiveEnd = Math.Min(Math.Max(start, exclusiveEnd), _count);
             if (_coordinates == null)
-                return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, null, _contiguousStart + start, exclusiveEnd - start, _diagnostics);
+                return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, null, _contiguousStart + start, exclusiveEnd - start, _diagnostics, _livePredicate, false);
             int[] result = new int[exclusiveEnd - start];
             Array.Copy(_coordinates, start, result, 0, result.Length);
-            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics);
+            return new LawfulNodeQuery<TRoot, TNode>(_store, _shape, result, 0, result.Length, _diagnostics, _livePredicate, false);
         }
 
         private int CoordinateAt(int index) => _coordinates == null ? _contiguousStart + index : _coordinates[index];
+
+        private static Expression<Func<TNode, bool>> CombinePredicates(Expression<Func<TNode, bool>> left, Expression<Func<TNode, bool>> right)
+        {
+            if (left == null) return right;
+            var parameter = Expression.Parameter(typeof(TNode), "node");
+            Expression leftBody = new ParameterReplaceVisitor(left.Parameters[0], parameter).Visit(left.Body);
+            Expression rightBody = new ParameterReplaceVisitor(right.Parameters[0], parameter).Visit(right.Body);
+            return Expression.Lambda<Func<TNode, bool>>(Expression.AndAlso(leftBody, rightBody), parameter);
+        }
+
+        private sealed class ParameterReplaceVisitor : ExpressionVisitor
+        {
+            private readonly ParameterExpression _from;
+            private readonly ParameterExpression _to;
+            public ParameterReplaceVisitor(ParameterExpression from, ParameterExpression to) { _from = from; _to = to; }
+            protected override Expression VisitParameter(ParameterExpression node) => node == _from ? _to : base.VisitParameter(node);
+        }
     }
 
     public sealed class LawfulValueQuery<T>
     {
         private readonly T[] _values;
         private readonly LawfulQueryDiagnostics _diagnostics;
-        public LawfulValueQuery(T[] values, LawfulQueryDiagnostics diagnostics) { _values = values; _diagnostics = diagnostics; }
+        private readonly Func<Action<LawfulQueryChange<T>>, IDisposable> _subscribe;
+        public LawfulValueQuery(T[] values, LawfulQueryDiagnostics diagnostics) : this(values, diagnostics, null) { }
+        internal LawfulValueQuery(T[] values, LawfulQueryDiagnostics diagnostics, Func<Action<LawfulQueryChange<T>>, IDisposable> subscribe)
+        { _values = values; _diagnostics = diagnostics; _subscribe = subscribe; }
         public int Count => _values.Length;
         public LawfulQueryDiagnostics Diagnostics => _diagnostics;
         public LawfulPreparedValuePlan<T> Prepare(int maximumAdditionalValues = 0) => new LawfulPreparedValuePlan<T>(_values, maximumAdditionalValues, _diagnostics);
@@ -224,20 +264,56 @@ namespace Memory2
         internal T[] UnsafeValues => _values;
         public T[] ToArray() { var copy = new T[_values.Length]; Array.Copy(_values, copy, copy.Length); return copy; }
 
+        /// <summary>Runs for each value that newly enters this projected query result.</summary>
+        public IDisposable Subscribe(Action<T> onEntered)
+        {
+            if (onEntered == null) throw new ArgumentNullException(nameof(onEntered));
+            return SubscribeChanges(change => { if (change.Kind == LawfulTransitionKind.Entered && change.HasCurrent) onEntered(change.Current); });
+        }
+
+        /// <summary>Observes entered, updated, and left values in this projected query result.</summary>
+        public IDisposable SubscribeChanges(Action<LawfulQueryChange<T>> handler)
+        {
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            if (_subscribe == null) throw new NotSupportedException("This value sequence is a snapshot. Subscribe directly after a live From(...).Where(...).Select(...) query.");
+            return _subscribe(handler);
+        }
+
         public LawfulValueQuery<T> Where(Func<T, bool> predicate)
         {
             if (predicate == null) throw new ArgumentNullException(nameof(predicate));
             T[] scratch = new T[_values.Length]; int output = 0;
             for (int i = 0; i < _values.Length; i++) { _diagnostics.PredicateEvaluations++; if (predicate(_values[i])) scratch[output++] = _values[i]; }
             T[] result = new T[output]; Array.Copy(scratch, result, output); _diagnostics.OperatorExecutions++;
-            return new LawfulValueQuery<T>(result, _diagnostics);
+            Func<Action<LawfulQueryChange<T>>, IDisposable> subscribe = null;
+            if (_subscribe != null)
+            {
+                subscribe = handler => _subscribe(change =>
+                {
+                    bool before = change.HasPrevious && predicate(change.Previous);
+                    bool after = change.HasCurrent && predicate(change.Current);
+                    if (!before && !after) return;
+                    LawfulTransitionKind kind = !before ? LawfulTransitionKind.Entered : !after ? LawfulTransitionKind.Left : LawfulTransitionKind.Updated;
+                    handler(new LawfulQueryChange<T>(kind, change.Previous, before, change.Current, after, change.RootId, change.LocalIndex));
+                });
+            }
+            return new LawfulValueQuery<T>(result, _diagnostics, subscribe);
         }
 
         public LawfulValueQuery<TResult> Select<TResult>(Func<T, TResult> selector)
         {
             TResult[] result = new TResult[_values.Length];
             for (int i = 0; i < result.Length; i++) result[i] = selector(_values[i]);
-            return new LawfulValueQuery<TResult>(result, _diagnostics);
+            Func<Action<LawfulQueryChange<TResult>>, IDisposable> subscribe = null;
+            if (_subscribe != null)
+            {
+                subscribe = handler => _subscribe(change => handler(new LawfulQueryChange<TResult>(
+                    change.Kind,
+                    change.HasPrevious ? selector(change.Previous) : default(TResult), change.HasPrevious,
+                    change.HasCurrent ? selector(change.Current) : default(TResult), change.HasCurrent,
+                    change.RootId, change.LocalIndex)));
+            }
+            return new LawfulValueQuery<TResult>(result, _diagnostics, subscribe);
         }
 
         public LawfulValueQuery<T> Distinct(IEqualityComparer<T> comparer = null)

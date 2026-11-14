@@ -3,7 +3,7 @@
     <TargetFramework>netstandard2.0</TargetFramework>
     <RootNamespace>Memory2</RootNamespace>
     <AssemblyName>Memory2</AssemblyName>
-    <Version>1.0.1</Version>
+    <Version>1.0.2</Version>
     <Deterministic>true</Deterministic>
     <LangVersion>10.0</LangVersion>
     <AssemblyTitle>Memory2</AssemblyTitle>
@@ -31,6 +31,14 @@
       <PackagePath>\</PackagePath>
     </None>
     <None Include="..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\BENCHMARKS.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <None Include="..\REACTIVE_QUERIES.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>

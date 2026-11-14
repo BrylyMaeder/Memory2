@@ -602,51 +602,58 @@ Use deletion for the whole owned domain. Do not manually delete every inner obje
 
 ## Subscribe to live conditions
 
-A subscription keeps a condition active and calls application logic when an object enters, changes inside, or leaves that condition.
+A subscription is a live LINQ result. Build the same query used for a snapshot, project exactly what the computation needs, and replace the snapshot terminal with `Subscribe`.
 
 ```csharp
-var events = db.Set<OperationalEvent>();
+using var subscription = db.From<OperationalEvent>()
+    .Where(item => item.Ready)
+    .Where(item => item.Severity >= 7)
+    .Where(item => item.Topic == "orders")
+    .Select(item => item.Id)
+    .Subscribe(StartWork);
+```
 
-using var subscription = events.Subscribe(
-    item => item.Ready &&
-            item.Severity >= 7 &&
-            item.Topic == "orders",
-    transition =>
+`Subscribe(Action<T>)` runs when a projected value enters the query result. Leaving and later re-entering runs it again. There is no separate `When` or `BecomesTrue` language: entry is a change in query membership.
+
+Observe every transition when application logic needs the previous and current projection:
+
+```csharp
+using var observation = db.From<OperationalEvent>()
+    .Where(item => item.Ready && item.Severity >= 7)
+    .Select(item => new { item.Id, item.Severity })
+    .SubscribeChanges(change =>
     {
-        switch (transition.Kind)
-        {
-            case SubscriptionChangeKind.Entered:
-                StartWork(transition.Current);
-                break;
-
-            case SubscriptionChangeKind.Updated:
-                RefreshWork(transition.Current);
-                break;
-
-            case SubscriptionChangeKind.Left:
-                StopWork(transition.Previous);
-                break;
-        }
+        if (change.Kind == LawfulTransitionKind.Entered)
+            StartWork(change.Current.Id);
+        else if (change.Kind == LawfulTransitionKind.Updated)
+            RefreshWork(change.Current.Id, change.Current.Severity);
+        else
+            StopWork(change.Previous.Id);
     });
 ```
 
-Change state normally:
-
-```csharp
-OperationalEvent item = events.Load(eventId);
-item.Topic = "orders";
-item.Ready = true;
-item.Severity = 9;
-events.Upsert(item);
-```
-
-Memory2 evaluates the condition and reports the transition.
+The native engine extracts column dependencies from the LINQ predicate and projection. A mutation to a column the expression does not read cannot change the observable result, so Memory2 does not evaluate that query. Scalar projections do not hydrate models.
 
 ### Transition meanings
 
-- `Entered`: the object did not match before and matches now.
-- `Updated`: the object matched before and still matches after the change.
-- `Left`: the object matched before and no longer matches.
+- `Entered`: the coordinate did not belong to the result before and belongs afterward.
+- `Updated`: it belonged before and afterward, and an observed dependency changed.
+- `Left`: it belonged before and no longer belongs afterward.
+
+An unprojected query observes the complete matching row, so any scalar change can be `Updated`. Projection narrows both the returned value and the dependency set.
+
+### Measured dependency routing
+
+The focused Release proof registers 500 projected live queries, changes a column observed by only one, and performs one million tracked writes. Dependency routing performs 2 million predicate evaluations instead of the 1 billion required by a naïve extension of the former scan-every-query algorithm: exactly 500x fewer evaluations for that workload, with zero measured hot-path allocation.
+
+```bash
+dotnet run --configuration Release --project PerformanceLab -- \
+  --reactive-proof --subscriptions 500 --operations 1000000
+```
+
+See [REACTIVE_QUERIES.md](REACTIVE_QUERIES.md) for API semantics, implementation design, benchmark output, limitations, and the path to correlated and aggregate live queries.
+
+The flexible `MemoryStore` facade retains its existing set-level subscription API for dynamic object graphs. The query-centric API above is the native `LawfulMemoryStore<TRoot>` path.
 
 ### Subscription uses
 

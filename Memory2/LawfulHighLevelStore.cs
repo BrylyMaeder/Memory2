@@ -158,6 +158,7 @@ namespace Memory2
         private readonly Func<object, object> _getter;
         private readonly Action<object, object> _setter;
         private readonly Action<int, object> _typedModelWriter;
+        private readonly Func<int, object, bool> _typedModelEquals;
         public LawfulScalarColumn(PropertyInfo property, int count)
         {
             Property = property;
@@ -186,6 +187,16 @@ namespace Memory2
                 writerMethod = typeof(LawfulScalarColumn).GetMethod(nameof(WriteReferenceModelValue), BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(property.PropertyType);
             _typedModelWriter = Expression.Lambda<Action<int, object>>(
                 Expression.Call(Expression.Constant(this), writerMethod, index, propertyValue), index, instance).Compile();
+
+            MethodInfo equalsMethod;
+            if (nullableType != null)
+                equalsMethod = typeof(LawfulScalarColumn).GetMethod(nameof(NullableModelValueEquals), BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(nullableType);
+            else if (property.PropertyType.IsValueType)
+                equalsMethod = typeof(LawfulScalarColumn).GetMethod(nameof(ValueModelValueEquals), BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(property.PropertyType);
+            else
+                equalsMethod = typeof(LawfulScalarColumn).GetMethod(nameof(ReferenceModelValueEquals), BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(property.PropertyType);
+            _typedModelEquals = Expression.Lambda<Func<int, object, bool>>(
+                Expression.Call(Expression.Constant(this), equalsMethod, index, propertyValue), index, instance).Compile();
         }
         public void EnsureCapacity(int required)
         {
@@ -200,6 +211,8 @@ namespace Memory2
         public int Count => _values.Length;
         public object GetModelValue(object model) => _getter(model);
         public void WriteModel(int index, object model) => _typedModelWriter(index, model);
+        public bool ModelValueEquals(int index, object model) => _typedModelEquals(index, model);
+        public bool BoxedValueEquals(int index, object value) => object.Equals(Read(index), value);
 
         private void WriteValueModelValue<T>(int index, T value) where T : struct
         {
@@ -217,6 +230,21 @@ namespace Memory2
         {
             _hasValue[index] = value != null;
             ((T[])_values)[index] = value;
+        }
+
+        private bool ValueModelValueEquals<T>(int index, T value) where T : struct
+            => EqualityComparer<T>.Default.Equals(((T[])_values)[index], value);
+
+        private bool NullableModelValueEquals<T>(int index, T? value) where T : struct
+        {
+            if (_hasValue[index] != value.HasValue) return false;
+            return !value.HasValue || EqualityComparer<T>.Default.Equals(((T[])_values)[index], value.GetValueOrDefault());
+        }
+
+        private bool ReferenceModelValueEquals<T>(int index, T value) where T : class
+        {
+            if (_hasValue[index] != (value != null)) return false;
+            return value == null || EqualityComparer<T>.Default.Equals(((T[])_values)[index], value);
         }
         public void SetModelValue(object model, object value) => _setter(model, value);
         internal T[] GetTypedArray<T>()
@@ -413,6 +441,32 @@ namespace Memory2
         public int LocalIndex { get; }
     }
 
+    /// <summary>
+    /// A change in the result of a live lawful query. Values are projections read directly
+    /// from scalar columns; models are not hydrated unless the projection explicitly does so.
+    /// </summary>
+    public readonly struct LawfulQueryChange<T>
+    {
+        internal LawfulQueryChange(LawfulTransitionKind kind, T previous, bool hasPrevious, T current, bool hasCurrent, long rootId, int localIndex)
+        {
+            Kind = kind;
+            Previous = previous;
+            HasPrevious = hasPrevious;
+            Current = current;
+            HasCurrent = hasCurrent;
+            RootId = rootId;
+            LocalIndex = localIndex;
+        }
+
+        public LawfulTransitionKind Kind { get; }
+        public T Previous { get; }
+        public bool HasPrevious { get; }
+        public T Current { get; }
+        public bool HasCurrent { get; }
+        public long RootId { get; }
+        public int LocalIndex { get; }
+    }
+
     public sealed class LawfulScalarMutation
     {
         internal LawfulScalarMutation(Guid mutationId, Type nodeType, int rootIndex, int localIndex, object[] values)
@@ -441,9 +495,15 @@ namespace Memory2
         private long _lastColumnBytes;
         private long _lastColumnHeaderBytes;
         private readonly List<ILawfulSubscription> _subscriptions = new List<ILawfulSubscription>();
+        private readonly Dictionary<LawfulScalarColumn, List<ILawfulSubscription>> _subscriptionsByColumn = new Dictionary<LawfulScalarColumn, List<ILawfulSubscription>>();
+        private readonly Dictionary<LawfulNodeShape, List<ILawfulSubscription>> _wildcardSubscriptions = new Dictionary<LawfulNodeShape, List<ILawfulSubscription>>();
         private readonly HashSet<Guid> _appliedMutations = new HashSet<Guid>();
         private long _subscriptionEvaluations;
         private long _subscriptionTransitions;
+        private long _subscriptionRouteProbes;
+        private long _subscriptionDispatchEpoch;
+        private ILawfulSubscription[][] _subscriptionDispatchBuffers = new ILawfulSubscription[2][];
+        private int _subscriptionPublishDepth;
         private long _synchronizationApplies;
         private readonly Action<TRoot, long> _setRootId;
         private readonly Dictionary<Type, HydrationPlan> _hydrationPlans = new Dictionary<Type, HydrationPlan>();
@@ -490,6 +550,7 @@ namespace Memory2
         public long LastStructuralBytes => _lastSchemaBytes + _lastColumnHeaderBytes;
         public long SubscriptionEvaluations => _subscriptionEvaluations;
         public long SubscriptionTransitions => _subscriptionTransitions;
+        public long SubscriptionRouteProbes => _subscriptionRouteProbes;
         public long SynchronizationApplies => _synchronizationApplies;
         public LawfulRootSet<TRoot> Set() => new LawfulRootSet<TRoot>(this);
 
@@ -508,6 +569,29 @@ namespace Memory2
         internal Func<int, TResult> CompileQuerySelector<TNode, TResult>(LawfulNodeShape shape, Expression<Func<TNode, TResult>> selector)
             where TNode : class, new()
             => CompileScalarSelector(shape, selector);
+
+        internal IDisposable SubscribeQuery<TNode>(LawfulNodeShape shape, Expression<Func<TNode, bool>> predicate, Action<LawfulTransition> handler)
+            where TNode : class, new()
+        {
+            if (predicate == null) predicate = _ => true;
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            var subscription = new LawfulSubscription<TNode>(this, shape, CompileScalarSelector(shape, predicate), handler);
+            // An unprojected query exposes the complete matching row. Any scalar mutation
+            // can therefore be an Updated result even when membership does not change.
+            return RegisterSubscription(subscription, shape);
+        }
+
+        internal IDisposable SubscribeQuery<TNode, TResult>(LawfulNodeShape shape, Expression<Func<TNode, bool>> predicate,
+            Expression<Func<TNode, TResult>> selector, Action<LawfulQueryChange<TResult>> handler)
+            where TNode : class, new()
+        {
+            if (predicate == null) predicate = _ => true;
+            if (selector == null) throw new ArgumentNullException(nameof(selector));
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            var subscription = new LawfulProjectedSubscription<TNode, TResult>(this, shape,
+                CompileScalarSelector(shape, predicate), CompileScalarSelector(shape, selector), handler);
+            return RegisterSubscription(subscription, shape, predicate, selector);
+        }
 
         internal Action<int, TNode> CompileQueryReader<TNode>(LawfulNodeShape shape) where TNode : class, new()
             => CompileScalarReader<TNode>(shape);
@@ -609,9 +693,7 @@ namespace Memory2
             if (predicate == null) throw new ArgumentNullException(nameof(predicate));
             if (handler == null) throw new ArgumentNullException(nameof(handler));
             if (!_schema.TryShape(typeof(TNode), out LawfulNodeShape shape)) throw new InvalidOperationException("The type is not part of the lawful schema.");
-            var subscription = new LawfulSubscription<TNode>(this, shape, CompileScalarSelector(shape, predicate), handler);
-            _subscriptions.Add(subscription);
-            return subscription;
+            return SubscribeQuery(shape, predicate, handler);
         }
 
         public LawfulScalarMutation CreateMutation<TNode>(TNode model) where TNode : class
@@ -630,9 +712,9 @@ namespace Memory2
             if ((uint)mutation.RootIndex >= (uint)_nextRoot || !_rootVisibility.IsVisible(mutation.RootIndex)) throw new InvalidOperationException("The mutation root is not live.");
             _appliedMutations.Add(mutation.MutationId);
             int index = Index(shape, mutation.RootIndex, mutation.LocalIndex);
-            ulong before = EvaluateSubscriptions(shape, index);
+            ILawfulSubscription candidates = CaptureChangedSubscriptions(shape, index, mutation.Values);
             for (int i = 0; i < shape.Scalars.Count; i++) shape.Scalars[i].Write(index, mutation.Values[i]);
-            PublishSubscriptions(shape, mutation.RootIndex, mutation.LocalIndex, index, before);
+            PublishChangedSubscriptions(candidates, shape, mutation.RootIndex, mutation.LocalIndex, index);
             _synchronizationApplies++;
             return true;
         }
@@ -642,9 +724,9 @@ namespace Memory2
             if (model == null) throw new ArgumentNullException(nameof(model));
             if (!_identities.TryGetValue(model, out LawfulIdentityBox box)) throw new InvalidOperationException("The object was not materialized by this lawful store.");
             int index = Index(box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex);
-            ulong before = EvaluateSubscriptions(box.Identity.Shape, index);
+            ILawfulSubscription candidates = CaptureChangedSubscriptions(box.Identity.Shape, index, model);
             WriteScalars(box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex, model);
-            PublishSubscriptions(box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex, index, before);
+            PublishChangedSubscriptions(candidates, box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex, index);
             _directWrites++;
         }
 
@@ -1239,64 +1321,325 @@ namespace Memory2
             foreach (LawfulScalarColumn column in shape.Scalars) column.SetModelValue(model, column.Read(index));
         }
 
-        private ulong EvaluateSubscriptions(LawfulNodeShape shape, int index)
+        private IDisposable RegisterSubscription(ILawfulSubscription subscription, LawfulNodeShape shape, params LambdaExpression[] expressions)
         {
-            int count = _subscriptions.Count;
-            if (count == 0) return 0UL;
-            if (count > 64) throw new NotSupportedException("The allocation-free lawful subscription fast path supports up to 64 active subscriptions.");
-            ulong mask = 0UL;
-            for (int i = 0; i < count; i++)
+            LawfulScalarColumn[] dependencies = CollectDependencies(shape, expressions);
+            subscription.Dependencies = dependencies;
+            _subscriptions.Add(subscription);
+            // Reserve the normal and first nested dispatch frames at registration time so
+            // both ordinary and write-back consequences stay allocation-free at runtime.
+            GetSubscriptionDispatchBuffer(0, _subscriptions.Count);
+            GetSubscriptionDispatchBuffer(1, _subscriptions.Count);
+            if (dependencies.Length == 0)
             {
-                ILawfulSubscription subscription = _subscriptions[i];
-                if (!ReferenceEquals(subscription.Shape, shape)) continue;
-                if (subscription.Evaluate(index)) mask |= 1UL << i;
-                _subscriptionEvaluations++;
+                if (!_wildcardSubscriptions.TryGetValue(shape, out List<ILawfulSubscription> wildcard))
+                {
+                    wildcard = new List<ILawfulSubscription>();
+                    _wildcardSubscriptions.Add(shape, wildcard);
+                }
+                wildcard.Add(subscription);
             }
-            return mask;
+            else
+            {
+                for (int i = 0; i < dependencies.Length; i++)
+                {
+                    LawfulScalarColumn column = dependencies[i];
+                    if (!_subscriptionsByColumn.TryGetValue(column, out List<ILawfulSubscription> subscribers))
+                    {
+                        subscribers = new List<ILawfulSubscription>();
+                        _subscriptionsByColumn.Add(column, subscribers);
+                    }
+                    subscribers.Add(subscription);
+                }
+            }
+            return subscription;
         }
 
-        private void PublishSubscriptions(LawfulNodeShape shape, int rootIndex, int localIndex, int index, ulong before)
+        private static LawfulScalarColumn[] CollectDependencies(LawfulNodeShape shape, params LambdaExpression[] expressions)
         {
-            int count = _subscriptions.Count;
-            if (count == 0) return;
-            for (int i = 0; i < count; i++)
+            var byProperty = shape.Scalars.ToDictionary(x => x.Property, x => x);
+            var dependencies = new HashSet<LawfulScalarColumn>();
+            var visitor = new SubscriptionDependencyVisitor(byProperty, dependencies);
+            for (int i = 0; i < expressions.Length; i++)
+                if (expressions[i] != null) visitor.Visit(expressions[i].Body);
+            return dependencies.ToArray();
+        }
+
+        private void RemoveSubscription(ILawfulSubscription subscription)
+        {
+            _subscriptions.Remove(subscription);
+            LawfulScalarColumn[] dependencies = subscription.Dependencies;
+            if (dependencies.Length == 0)
             {
-                ILawfulSubscription subscription = _subscriptions[i];
-                if (!ReferenceEquals(subscription.Shape, shape)) continue;
-                bool was = (before & (1UL << i)) != 0;
-                bool after = subscription.Evaluate(index);
-                _subscriptionEvaluations++;
-                LawfulTransitionKind kind;
-                if (!was && after) kind = LawfulTransitionKind.Entered;
-                else if (was && !after) kind = LawfulTransitionKind.Left;
-                else if (was && after) kind = LawfulTransitionKind.Updated;
-                else continue;
-                subscription.Publish(new LawfulTransition(kind, shape.Type, rootIndex + 1L, localIndex));
-                _subscriptionTransitions++;
+                if (_wildcardSubscriptions.TryGetValue(subscription.Shape, out List<ILawfulSubscription> wildcard))
+                {
+                    wildcard.Remove(subscription);
+                    if (wildcard.Count == 0) _wildcardSubscriptions.Remove(subscription.Shape);
+                }
+                return;
+            }
+            for (int i = 0; i < dependencies.Length; i++)
+            {
+                LawfulScalarColumn column = dependencies[i];
+                if (!_subscriptionsByColumn.TryGetValue(column, out List<ILawfulSubscription> subscribers)) continue;
+                subscribers.Remove(subscription);
+                if (subscribers.Count == 0) _subscriptionsByColumn.Remove(column);
             }
         }
 
-        private interface ILawfulSubscription
+        private ILawfulSubscription CaptureChangedSubscriptions(LawfulNodeShape shape, int index, object model)
+        {
+            if (_subscriptions.Count == 0) return null;
+            long epoch = unchecked(++_subscriptionDispatchEpoch);
+            ILawfulSubscription head = null;
+            bool changed = false;
+            for (int i = 0; i < shape.Scalars.Count; i++)
+            {
+                LawfulScalarColumn column = shape.Scalars[i];
+                if (column.ModelValueEquals(index, model)) continue;
+                changed = true;
+                RouteColumnSubscribers(column, index, epoch, _subscriptionPublishDepth, ref head);
+            }
+            if (changed) RouteWildcardSubscribers(shape, index, epoch, _subscriptionPublishDepth, ref head);
+            return head;
+        }
+
+        private ILawfulSubscription CaptureChangedSubscriptions(LawfulNodeShape shape, int index, object[] values)
+        {
+            if (_subscriptions.Count == 0) return null;
+            long epoch = unchecked(++_subscriptionDispatchEpoch);
+            ILawfulSubscription head = null;
+            bool changed = false;
+            for (int i = 0; i < shape.Scalars.Count; i++)
+            {
+                LawfulScalarColumn column = shape.Scalars[i];
+                if (column.BoxedValueEquals(index, values[i])) continue;
+                changed = true;
+                RouteColumnSubscribers(column, index, epoch, _subscriptionPublishDepth, ref head);
+            }
+            if (changed) RouteWildcardSubscribers(shape, index, epoch, _subscriptionPublishDepth, ref head);
+            return head;
+        }
+
+        private void RouteColumnSubscribers(LawfulScalarColumn column, int index, long epoch, int dispatchDepth, ref ILawfulSubscription head)
+        {
+            if (!_subscriptionsByColumn.TryGetValue(column, out List<ILawfulSubscription> subscribers)) return;
+            _subscriptionRouteProbes += subscribers.Count;
+            for (int i = 0; i < subscribers.Count; i++) CaptureCandidate(subscribers[i], index, epoch, dispatchDepth, ref head);
+        }
+
+        private void RouteWildcardSubscribers(LawfulNodeShape shape, int index, long epoch, int dispatchDepth, ref ILawfulSubscription head)
+        {
+            if (!_wildcardSubscriptions.TryGetValue(shape, out List<ILawfulSubscription> subscribers)) return;
+            _subscriptionRouteProbes += subscribers.Count;
+            for (int i = 0; i < subscribers.Count; i++) CaptureCandidate(subscribers[i], index, epoch, dispatchDepth, ref head);
+        }
+
+        private void CaptureCandidate(ILawfulSubscription subscription, int index, long epoch, int dispatchDepth, ref ILawfulSubscription head)
+        {
+            if (subscription.DispatchEpoch == epoch) return;
+            subscription.DispatchEpoch = epoch;
+            subscription.CaptureBefore(index, dispatchDepth);
+            _subscriptionEvaluations++;
+            subscription.NextCandidate = head;
+            head = subscription;
+        }
+
+        private void PublishChangedSubscriptions(ILawfulSubscription head, LawfulNodeShape shape, int rootIndex, int localIndex, int index)
+        {
+            if (head == null) return;
+
+            int count = 0;
+            for (ILawfulSubscription candidate = head; candidate != null; candidate = candidate.NextCandidate) count++;
+            int depth = _subscriptionPublishDepth;
+            ILawfulSubscription[] dispatch = GetSubscriptionDispatchBuffer(depth, count);
+            _subscriptionPublishDepth++;
+            int captured = 0;
+            while (head != null)
+            {
+                ILawfulSubscription next = head.NextCandidate;
+                head.NextCandidate = null;
+                dispatch[captured++] = head;
+                head = next;
+            }
+
+            try
+            {
+                for (int i = 0; i < captured; i++)
+                {
+                    bool published = dispatch[i].CaptureAfter(index, rootIndex + 1L, localIndex, depth);
+                    _subscriptionEvaluations++;
+                    if (published) _subscriptionTransitions++;
+                }
+                for (int i = 0; i < captured; i++) dispatch[i].PublishCaptured(depth);
+            }
+            finally
+            {
+                for (int i = 0; i < captured; i++) dispatch[i].ClearCaptured(depth);
+                Array.Clear(dispatch, 0, captured);
+                _subscriptionPublishDepth--;
+            }
+        }
+
+        private ILawfulSubscription[] GetSubscriptionDispatchBuffer(int depth, int required)
+        {
+            if (depth >= _subscriptionDispatchBuffers.Length)
+                Array.Resize(ref _subscriptionDispatchBuffers, checked(_subscriptionDispatchBuffers.Length * 2));
+            ILawfulSubscription[] buffer = _subscriptionDispatchBuffers[depth];
+            if (buffer != null && buffer.Length >= required) return buffer;
+            int capacity = 4;
+            while (capacity < required) capacity = checked(capacity * 2);
+            buffer = new ILawfulSubscription[capacity];
+            _subscriptionDispatchBuffers[depth] = buffer;
+            return buffer;
+        }
+
+        private interface ILawfulSubscription : IDisposable
         {
             LawfulNodeShape Shape { get; }
-            bool Evaluate(int index);
-            void Publish(LawfulTransition transition);
+            LawfulScalarColumn[] Dependencies { get; set; }
+            long DispatchEpoch { get; set; }
+            ILawfulSubscription NextCandidate { get; set; }
+            void CaptureBefore(int index, int dispatchDepth);
+            bool CaptureAfter(int index, long rootId, int localIndex, int dispatchDepth);
+            void PublishCaptured(int dispatchDepth);
+            void ClearCaptured(int dispatchDepth);
             void Remove();
         }
 
-        private sealed class LawfulSubscription<TNode> : ILawfulSubscription, IDisposable where TNode : class, new()
+        private abstract class LawfulSubscriptionBase : ILawfulSubscription, IDisposable
         {
-            private readonly LawfulMemoryStore<TRoot> _owner;
-            private readonly Func<int, bool> _predicate;
-            private readonly Action<LawfulTransition> _handler;
+            protected readonly LawfulMemoryStore<TRoot> Owner;
+            protected readonly Func<int, bool> Predicate;
+            private bool[] _beforeMatches = new bool[2];
             private bool _disposed;
-            public LawfulSubscription(LawfulMemoryStore<TRoot> owner, LawfulNodeShape shape, Func<int, bool> predicate, Action<LawfulTransition> handler)
-            { _owner = owner; Shape = shape; _predicate = predicate; _handler = handler; }
+
+            protected LawfulSubscriptionBase(LawfulMemoryStore<TRoot> owner, LawfulNodeShape shape, Func<int, bool> predicate)
+            { Owner = owner; Shape = shape; Predicate = predicate; Dependencies = Array.Empty<LawfulScalarColumn>(); }
+
             public LawfulNodeShape Shape { get; }
-            public bool Evaluate(int index) => _predicate(index);
-            public void Publish(LawfulTransition transition) => _handler(transition);
-            public void Remove() { if (!_disposed) { _disposed = true; _owner._subscriptions.Remove(this); } }
+            public LawfulScalarColumn[] Dependencies { get; set; }
+            public long DispatchEpoch { get; set; }
+            public ILawfulSubscription NextCandidate { get; set; }
+            public virtual void CaptureBefore(int index, int dispatchDepth)
+            {
+                EnsureDispatchDepth(ref _beforeMatches, dispatchDepth);
+                _beforeMatches[dispatchDepth] = Predicate(index);
+            }
+            protected bool BeforeMatch(int dispatchDepth) => _beforeMatches[dispatchDepth];
+            protected static void EnsureDispatchDepth<T>(ref T[] values, int dispatchDepth)
+            {
+                if (dispatchDepth < values.Length) return;
+                int length = values.Length;
+                while (length <= dispatchDepth) length = checked(length * 2);
+                Array.Resize(ref values, length);
+            }
+            public abstract bool CaptureAfter(int index, long rootId, int localIndex, int dispatchDepth);
+            public abstract void PublishCaptured(int dispatchDepth);
+            public abstract void ClearCaptured(int dispatchDepth);
+            public void Remove() { if (!_disposed) { _disposed = true; Owner.RemoveSubscription(this); } }
             public void Dispose() => Remove();
+        }
+
+        private sealed class LawfulSubscription<TNode> : LawfulSubscriptionBase where TNode : class, new()
+        {
+            private readonly Action<LawfulTransition> _handler;
+            private LawfulTransition[] _transitions = new LawfulTransition[2];
+            public LawfulSubscription(LawfulMemoryStore<TRoot> owner, LawfulNodeShape shape, Func<int, bool> predicate, Action<LawfulTransition> handler)
+                : base(owner, shape, predicate) { _handler = handler; }
+
+            public override bool CaptureAfter(int index, long rootId, int localIndex, int dispatchDepth)
+            {
+                bool after = Predicate(index);
+                bool before = BeforeMatch(dispatchDepth);
+                LawfulTransitionKind kind;
+                if (!before && after) kind = LawfulTransitionKind.Entered;
+                else if (before && !after) kind = LawfulTransitionKind.Left;
+                else if (before && after) kind = LawfulTransitionKind.Updated;
+                else return false;
+                EnsureDispatchDepth(ref _transitions, dispatchDepth);
+                _transitions[dispatchDepth] = new LawfulTransition(kind, Shape.Type, rootId, localIndex);
+                return true;
+            }
+
+            public override void PublishCaptured(int dispatchDepth)
+            {
+                if (dispatchDepth >= _transitions.Length) return;
+                LawfulTransition transition = _transitions[dispatchDepth];
+                if (transition == null) return;
+                _transitions[dispatchDepth] = null;
+                _handler(transition);
+            }
+
+            public override void ClearCaptured(int dispatchDepth)
+            {
+                if (dispatchDepth < _transitions.Length) _transitions[dispatchDepth] = null;
+            }
+        }
+
+        private sealed class LawfulProjectedSubscription<TNode, TResult> : LawfulSubscriptionBase where TNode : class, new()
+        {
+            private readonly Func<int, TResult> _selector;
+            private readonly Action<LawfulQueryChange<TResult>> _handler;
+            private TResult[] _previous = new TResult[2];
+            private LawfulQueryChange<TResult>[] _changes = new LawfulQueryChange<TResult>[2];
+            private bool[] _hasChanges = new bool[2];
+
+            public LawfulProjectedSubscription(LawfulMemoryStore<TRoot> owner, LawfulNodeShape shape, Func<int, bool> predicate,
+                Func<int, TResult> selector, Action<LawfulQueryChange<TResult>> handler)
+                : base(owner, shape, predicate) { _selector = selector; _handler = handler; }
+
+            public override void CaptureBefore(int index, int dispatchDepth)
+            {
+                base.CaptureBefore(index, dispatchDepth);
+                EnsureDispatchDepth(ref _previous, dispatchDepth);
+                _previous[dispatchDepth] = BeforeMatch(dispatchDepth) ? _selector(index) : default(TResult);
+            }
+
+            public override bool CaptureAfter(int index, long rootId, int localIndex, int dispatchDepth)
+            {
+                bool after = Predicate(index);
+                bool before = BeforeMatch(dispatchDepth);
+                if (!before && !after) return false;
+                TResult current = after ? _selector(index) : default(TResult);
+                LawfulTransitionKind kind = !before ? LawfulTransitionKind.Entered : !after ? LawfulTransitionKind.Left : LawfulTransitionKind.Updated;
+                EnsureDispatchDepth(ref _changes, dispatchDepth);
+                EnsureDispatchDepth(ref _hasChanges, dispatchDepth);
+                _changes[dispatchDepth] = new LawfulQueryChange<TResult>(kind, _previous[dispatchDepth], before, current, after, rootId, localIndex);
+                _hasChanges[dispatchDepth] = true;
+                return true;
+            }
+
+            public override void PublishCaptured(int dispatchDepth)
+            {
+                if (dispatchDepth >= _hasChanges.Length) return;
+                if (!_hasChanges[dispatchDepth]) return;
+                LawfulQueryChange<TResult> change = _changes[dispatchDepth];
+                ClearCaptured(dispatchDepth);
+                _handler(change);
+            }
+
+            public override void ClearCaptured(int dispatchDepth)
+            {
+                if (dispatchDepth < _previous.Length) _previous[dispatchDepth] = default(TResult);
+                if (dispatchDepth >= _hasChanges.Length) return;
+                _hasChanges[dispatchDepth] = false;
+                _changes[dispatchDepth] = default(LawfulQueryChange<TResult>);
+            }
+        }
+
+        private sealed class SubscriptionDependencyVisitor : ExpressionVisitor
+        {
+            private readonly IReadOnlyDictionary<PropertyInfo, LawfulScalarColumn> _columns;
+            private readonly ISet<LawfulScalarColumn> _dependencies;
+            public SubscriptionDependencyVisitor(IReadOnlyDictionary<PropertyInfo, LawfulScalarColumn> columns, ISet<LawfulScalarColumn> dependencies)
+            { _columns = columns; _dependencies = dependencies; }
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Member is PropertyInfo property && _columns.TryGetValue(property, out LawfulScalarColumn column))
+                    _dependencies.Add(column);
+                return base.VisitMember(node);
+            }
         }
 
         public void Dispose()

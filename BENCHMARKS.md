@@ -133,3 +133,34 @@ The closed-form checksum completed without overflow at the maximum coordinate. T
 The proof establishes that a finite relation over one or more invertible generated axes can be compiled into residue sets, intersected before enumeration, and answered without scanning or maintaining per-record relation storage. Closed-form count and checksum are independent of logical population size. Sparse mutation reconciliation is proportional to the number of physical patches, not the logical population.
 
 It does not establish constant-time enumeration: returning `k` IDs still costs at least O(k). It does not make arbitrary application predicates algebraically invertible. Non-bijective axes and non-point transforms fall back to correctness-first verification or scanning. Results also depend on relation cardinality, modulus, query mix, hardware, and runtime. These boundaries are enforced by tests rather than hidden by the benchmark.
+
+## Reactive LINQ dependency-routing proof
+
+The native lawful engine now treats `From(...).Where(...).Select(...).Subscribe(...)` as a live projected query. Predicates and projections are inspected once at registration to determine exactly which scalar columns can change the observable result. A write routes through subscriptions attached to its changed columns instead of scanning every active condition.
+
+Reproduce the proof:
+
+```powershell
+dotnet run --project PerformanceLab/Memory2.PerformanceLab.csproj `
+  --configuration Release -- --reactive-proof `
+  --subscriptions 500 --operations 1000000
+```
+
+Measured November 14, 2026 on the same machine and runtime documented above:
+
+| Measurement | Result |
+|---|---:|
+| Live projected queries | 500 |
+| Tracked writes | 1,000,000 |
+| Elapsed | 0.328 s |
+| Throughput | 3,048,503 writes/sec |
+| Naïvely extended scan-every-query evaluations | 1,000,000,000 |
+| Dependency-routed evaluations | 2,000,000 |
+| Dependency route probes | 1,000,000 |
+| Evaluation reduction | **500.0x** |
+| Measured allocation | 0 bytes |
+| GC collections (0/1/2) | 0 / 0 / 0 |
+
+The workload registers 499 projected queries whose predicate reads `Score` and one whose predicate reads `Active`. It then toggles only `Active`. A naïve extension of the former scan-every-query algorithm would evaluate all 500 predicates before and after every write; the former implementation itself capped registrations at 64. The new route evaluates the single affected predicate before and after. The result therefore proves a 500x reduction in predicate evaluations for this workload; it does not claim a universal 500x throughput multiplier.
+
+The benchmark also verifies the expected number of entered consequences and exits unsuccessfully if routing performs extra evaluations, allocates on the measured path, or returns an incorrect transition count. Full API semantics, implementation details, and current limitations are documented in [REACTIVE_QUERIES.md](REACTIVE_QUERIES.md).
