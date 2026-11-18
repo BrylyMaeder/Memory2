@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using Memory2.At;
+using Memory2.Determine;
 
 namespace Memory2.History
 {
@@ -76,7 +78,7 @@ namespace Memory2.History
             int r = (int)(id % _modulus); if (r < 0) r += _modulus;
             var bucket = _congruenceBuckets[r];
             for (int i = 0; i < bucket.Count; i++) if (bucket[i].Set.Contains(id)) bucket[i].Transform?.ApplyToObject(obj);
-            PointPatchShadow point = _pointPatches.Get(id); if (point != null) point.ApplyToObject(obj);
+            _pointPatches.ApplyToObject(id, obj);
             for (int i = 0; i < _ranges.Count; i++) if (_ranges[i].Set.Contains(id)) _ranges[i].Transform?.ApplyToObject(obj);
             for (int i = 0; i < _other.Count; i++) if (_other[i].Set.Contains(id)) _other[i].Transform?.ApplyToObject(obj);
         }
@@ -96,23 +98,34 @@ namespace Memory2.History
 
         internal bool TryGetPointPatchAxisValue<TValue>(long id, int axisIndex, out TValue value)
         {
-            PointPatchShadow patch = _pointPatches.Get(id);
-            if (patch != null) return patch.TryGetAxisValue(axisIndex, out value);
-            value = default(TValue);
-            return false;
+            return _pointPatches.TryGetAxisValue(id, axisIndex, out value);
         }
 
 
-        internal PointPatchShadow GetPointPatch(long id) => _pointPatches.Get(id);
+        internal bool HasPointPatch(long id) => _pointPatches.HasPatch(id);
+        internal bool TryApplyCompletePointState(long id, int axisCount, object obj) => _pointPatches.TryApplyCompletePointState(id, axisCount, obj);
+        internal bool HasCompiledAtSurface => _pointPatches.HasCompiledAtSurface;
+        internal int CompiledAtLength => _pointPatches.CompiledAtLength;
+        internal void GetCompiledAtInfo(out int length, out int leaves, out int nodes)
+            => _pointPatches.GetCompiledAtInfo(out length, out leaves, out nodes);
         internal PatchPage GetPointPatchPage(long pageIndex) => _pointPatches.GetPage(pageIndex);
 
         internal bool TryGetPointPatchAxisValue(long id, int axisIndex, out object value)
         {
-            PointPatchShadow patch = _pointPatches.Get(id);
-            if (patch != null) return patch.TryGetAxisValue(axisIndex, out value);
-            value = null;
-            return false;
+            return _pointPatches.TryGetAxisValue(id, axisIndex, out value);
         }
+
+        internal bool TryEncodePointPatchAxisValue(long id, int axisIndex, out int code, out int fingerprint, out bool found)
+            => _pointPatches.TryEncodeAxisValue(id, axisIndex, out code, out fingerprint, out found);
+
+        internal bool TryCompilePointPatches(DetermineSchema schema) => _pointPatches.TryCompile(schema);
+        internal bool TryGetCompiledAggregate(AtSolver.Plan plan, long startInclusive, long endExclusive,
+            out long count, out long checksum, out int length)
+            => _pointPatches.TryGetCompiledAggregate(plan, startInclusive, endExclusive, out count, out checksum, out length);
+        internal bool TryGetCompiledMatchingIds(AtSolver.Plan plan, long startInclusive, long endExclusive, out long[] ids, out int length)
+            => _pointPatches.TryGetCompiledMatchingIds(plan, startInclusive, endExclusive, out ids, out length);
+        internal bool CompiledBaseMatches(long id, AtSolver.Plan plan) => _pointPatches.CompiledBaseMatches(id, plan);
+        internal long[] GetPointOverrideIdsSnapshot() => _pointPatches.GetOverrideIdSnapshot();
 
         public SurfaceMillStatistics GetSurfaceMillStatistics() => _pointPatches.GetStatistics();
         internal IEnumerable<long> EnumeratePointPatchIds() => _pointPatches.EnumeratePatchedIds();

@@ -127,6 +127,20 @@ internal static class Program
         if (Array.Exists(args, x => string.Equals(x, "--reactive-proof", StringComparison.OrdinalIgnoreCase)))
             return ReactiveQueryProofLab.Run(args);
 
+        if (Array.Exists(args, x => string.Equals(x, "--compiled-at-proof", StringComparison.OrdinalIgnoreCase)))
+            return CompiledAtProofLab.Run(args);
+
+        if (Array.Exists(args, x => string.Equals(x, "--coordinate-intent-proof", StringComparison.OrdinalIgnoreCase)))
+            return CoordinateIntentProofLab.Run(args);
+
+        if (Array.Exists(args, x => string.Equals(x, "--high-level-hot-path-proof", StringComparison.OrdinalIgnoreCase)))
+        {
+            MixedStructure10MStressLab.RunHotPathProof(
+                checked((int)ReadLong(args, "--hot-roots", 100_000)),
+                checked((int)ReadLong(args, "--hot-trials", 5)));
+            return 0;
+        }
+
         PerformanceConfiguration configuration = PerformancePopulationSelector.Select();
         PerformancePopulation selectedPopulation = PerformancePopulation.OneHundredMillion;
 

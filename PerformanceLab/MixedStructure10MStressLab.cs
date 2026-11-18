@@ -80,6 +80,167 @@ internal static class MixedStructure10MStressLab
 {
     private readonly record struct Result(double PerSecond, double Nanoseconds, long Allocated, int G0, int G1, int G2, long Checksum);
 
+    internal static void RunHotPathProof(int roots, int trials)
+    {
+        if (roots < 4_096) throw new ArgumentOutOfRangeException(nameof(roots));
+        if (trials < 3) throw new ArgumentOutOfRangeException(nameof(trials));
+
+        const int propertyCount = 24;
+        const int graphWidth = 6;
+        const int hydrationOperations = 100_000;
+        const int writeOperations = 2_000_000;
+        Console.WriteLine("Memory2 high-level hot-path proof");
+        Console.WriteLine(new string('=', 62));
+        Console.WriteLine($"Aggregate roots:           {roots:N0}");
+        Console.WriteLine($"Logical objects:           {(long)roots * graphWidth:N0}");
+        Console.WriteLine($"Active scalar columns:     {propertyCount:N0}");
+        Console.WriteLine($"Measured trials:           {trials:N0}");
+
+        MixedRoot[] models = CreateHotPathModels(roots, propertyCount);
+        ForceGc();
+        using var store = LawfulMemoryStore.Create<MixedRoot>(
+            schema => ConfigurePhysicalSchema(schema, propertyCount),
+            initialCapacity: roots);
+        LawfulRootSet<MixedRoot> set = store.Set();
+
+        long createBefore = GC.GetAllocatedBytesForCurrentThread();
+        var createTimer = Stopwatch.StartNew();
+        set.CreateMany(models);
+        createTimer.Stop();
+        long createAllocated = GC.GetAllocatedBytesForCurrentThread() - createBefore;
+        Console.WriteLine();
+        Console.WriteLine("Bulk creation (prepared POCO graph -> live store)");
+        Console.WriteLine($"Elapsed:                   {createTimer.Elapsed.TotalMilliseconds:N3} ms");
+        Console.WriteLine($"Aggregate roots/sec:       {roots / createTimer.Elapsed.TotalSeconds:N0}");
+        Console.WriteLine($"Logical objects/sec:       {((long)roots * graphWidth) / createTimer.Elapsed.TotalSeconds:N0}");
+        Console.WriteLine($"Allocated during ingest:   {createAllocated:N0} bytes");
+
+        LawfulNodeQuery<MixedRoot, MixedRoot> query = store.From<MixedRoot>();
+        for (int i = 0; i < 8_192; i++) _ = query.HydrateAt(i & 4095);
+        var hydrationRates = new double[trials];
+        var hydrationNs = new double[trials];
+        var hydrationBytes = new double[trials];
+        long hydrationChecksum = 0;
+        for (int trial = 0; trial < trials; trial++)
+        {
+            ForceGc();
+            Result result = Measure(() =>
+            {
+                long checksum = 0;
+                for (int i = 0; i < hydrationOperations; i++)
+                {
+                    MixedRoot model = query.HydrateAt(i & 4095);
+                    checksum ^= model.Entropy;
+                    checksum += model.Events[0].Sequence + model.Events[1].Metadata.Fingerprint;
+                }
+                return checksum;
+            }, hydrationOperations);
+            hydrationRates[trial] = result.PerSecond;
+            hydrationNs[trial] = result.Nanoseconds;
+            hydrationBytes[trial] = result.Allocated / (double)hydrationOperations;
+            hydrationChecksum ^= result.Checksum;
+        }
+
+        Array.Sort(hydrationRates); Array.Sort(hydrationNs); Array.Sort(hydrationBytes);
+        int median = trials / 2;
+        Console.WriteLine();
+        Console.WriteLine("Complete six-object graph hydration (median)");
+        Console.WriteLine($"Graphs/sec:                {hydrationRates[median]:N0}");
+        Console.WriteLine($"Nanoseconds/graph:         {hydrationNs[median]:N2}");
+        Console.WriteLine($"Bytes/graph:               {hydrationBytes[median]:N2}");
+        Console.WriteLine($"Checksum:                  {hydrationChecksum:N0}");
+
+        var tracked = new MixedEvent[2_048];
+        LawfulNodeQuery<MixedRoot, MixedEvent> events = store.From<MixedEvent>();
+        for (int i = 0; i < tracked.Length; i++) tracked[i] = events.HydrateAt(i);
+        for (int i = 0; i < 50_000; i++)
+        {
+            MixedEvent model = tracked[i & (tracked.Length - 1)];
+            model.Amount++;
+            store.Save(model);
+        }
+        var writeRates = new double[trials];
+        var writeNs = new double[trials];
+        var writeBytes = new double[trials];
+        long writeChecksum = 0;
+        for (int trial = 0; trial < trials; trial++)
+        {
+            ForceGc();
+            Result result = Measure(() =>
+            {
+                long checksum = 0;
+                for (int i = 0; i < writeOperations; i++)
+                {
+                    MixedEvent model = tracked[i & (tracked.Length - 1)];
+                    model.Amount++;
+                    model.Accepted = !model.Accepted;
+                    store.Save(model);
+                    checksum += model.Amount;
+                }
+                return checksum;
+            }, writeOperations);
+            writeRates[trial] = result.PerSecond;
+            writeNs[trial] = result.Nanoseconds;
+            writeBytes[trial] = result.Allocated / (double)writeOperations;
+            writeChecksum ^= result.Checksum;
+        }
+
+        Array.Sort(writeRates); Array.Sort(writeNs); Array.Sort(writeBytes);
+        Console.WriteLine();
+        Console.WriteLine("Tracked public Save (median)");
+        Console.WriteLine($"Writes/sec:                {writeRates[median]:N0}");
+        Console.WriteLine($"Nanoseconds/write:         {writeNs[median]:N2}");
+        Console.WriteLine($"Bytes/write:               {writeBytes[median]:N2}");
+        Console.WriteLine($"Checksum:                  {writeChecksum:N0}");
+    }
+
+    internal static MixedRoot[] CreateHotPathModels(int roots, int propertyCount)
+    {
+        var models = new MixedRoot[roots];
+        uint state = 0xD1B54A35u;
+        for (int ordinal = 0; ordinal < roots; ordinal++)
+        {
+            state = Mix(state + unchecked((uint)ordinal * 0x9E3779B9u));
+            uint entropyState = state;
+            var root = new MixedRoot
+            {
+                Entropy = unchecked((long)(((ulong)entropyState << 32) | Mix(entropyState ^ 0x85EBCA6Bu))),
+                Tenant = (int)(entropyState & 4095),
+                Score = (int)((entropyState >> 8) & 65535),
+                Active = (entropyState & 15) != 0,
+                Risk = (MixedRisk)(1 + (entropyState % 4)),
+                Profile = new MixedProfile
+                {
+                    Region = "region-" + (entropyState & 63).ToString("D2"),
+                    Cohort = ordinal & 1023,
+                    BalanceBand = Mix(entropyState ^ 0xC2B2AE35u) & 0xFFFFF,
+                    Verified = (entropyState & 3) != 0
+                }
+            };
+            AssignRichness(root, entropyState, ordinal, propertyCount);
+            for (int e = 0; e < 2; e++)
+            {
+                uint es = Mix(entropyState + unchecked((uint)e * 0x27D4EB2Du));
+                root.Events.Add(new MixedEvent
+                {
+                    Sequence = ((long)ordinal << 1) + e + 1,
+                    Amount = es & 0xFFFFFF,
+                    Kind = (int)(es & 255),
+                    Accepted = (es & 7) != 0,
+                    Metadata = new MixedEventMetadata
+                    {
+                        Tag = "tag-" + (es & 255).ToString("D3"),
+                        Fingerprint = unchecked((long)(((ulong)es << 32) | Mix(es ^ 0x165667B1u))),
+                        Channel = (int)((es >> 8) & 127),
+                        Suspicious = (es & 127) == 0
+                    }
+                });
+            }
+            models[ordinal] = root;
+        }
+        return models;
+    }
+
     public static void Run(PerformancePopulation population)
     {
         Run(new PerformanceConfiguration((long)population, EntityRichness.Properties48, EntropyRate.Percent100));
@@ -512,7 +673,7 @@ internal static class MixedStructure10MStressLab
 
     private readonly record struct PhysicalSchemaAccounting(int PhysicalColumnCount, int ValuesPerAggregate, long SemanticBytesPerAggregate);
 
-    private static LawfulSchemaBuilder<MixedRoot> ConfigurePhysicalSchema(LawfulSchemaBuilder<MixedRoot> schema, int requestedColumns)
+    internal static LawfulSchemaBuilder<MixedRoot> ConfigurePhysicalSchema(LawfulSchemaBuilder<MixedRoot> schema, int requestedColumns)
     {
         schema
             .OwnsOne<MixedRoot, MixedProfile>(x => x.Profile)

@@ -55,6 +55,42 @@ namespace Memory2.History
         }
 
         internal int FieldCount => _axisIndices.Length;
+        internal bool CanCompile
+        {
+            get
+            {
+                if (_fallback != null) return false;
+                for (int i = 0; i < _kinds.Length; i++)
+                    if ((PatchValueKind)_kinds[i] == PatchValueKind.Object) return false;
+                return true;
+            }
+        }
+        internal bool HasStringValues
+        {
+            get
+            {
+                for (int i = 0; i < _kinds.Length; i++)
+                {
+                    PatchValueKind kind = (PatchValueKind)_kinds[i];
+                    if (kind == PatchValueKind.String || kind == PatchValueKind.GeneratedString) return true;
+                }
+                return false;
+            }
+        }
+        internal bool HasObjectValues
+        {
+            get
+            {
+                for (int i = 0; i < _kinds.Length; i++) if ((PatchValueKind)_kinds[i] == PatchValueKind.Object) return true;
+                return false;
+            }
+        }
+        internal bool CoversAllAxes(int axisCount)
+        {
+            if (_fallback != null || _axisIndices.Length != axisCount) return false;
+            for (int i = 0; i < _axisIndices.Length; i++) if (_axisIndices[i] != i) return false;
+            return true;
+        }
         internal long EstimatedPayloadBytes
         {
             get
@@ -66,6 +102,50 @@ namespace Memory2.History
         }
 
         internal static PointPatchShadow FromTransform(ICommitTransform transform) => new PointPatchShadow(transform);
+
+        internal void CopyValuesTo(ushort[] axes, byte[] kinds, long[] numbers, string[] strings, object[] objects, ref int destination)
+        {
+            if (_fallback != null) throw new InvalidOperationException("Opaque point transforms cannot be compiled into At values.");
+            for (int i = 0; i < _axisIndices.Length; i++, destination++)
+            {
+                axes[destination] = _axisIndices[i];
+                kinds[destination] = _kinds[i];
+                numbers[destination] = _numbers[i];
+                if (strings != null) strings[destination] = _strings[i];
+                if (objects != null) objects[destination] = _objects[i];
+            }
+        }
+
+        internal bool ContentEquals(PointPatchShadow other)
+        {
+            if (ReferenceEquals(this, other)) return true;
+            if (other == null || _fallback != null || other._fallback != null || _axisIndices.Length != other._axisIndices.Length) return false;
+            for (int i = 0; i < _axisIndices.Length; i++)
+            {
+                if (_axisIndices[i] != other._axisIndices[i] || _kinds[i] != other._kinds[i] || _numbers[i] != other._numbers[i]) return false;
+                if (!string.Equals(_strings[i], other._strings[i], StringComparison.Ordinal)) return false;
+                if (!Equals(_objects[i], other._objects[i])) return false;
+            }
+            return true;
+        }
+
+        internal int ContentHashCode()
+        {
+            if (_fallback != null) return System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this);
+            unchecked
+            {
+                int hash = 17;
+                for (int i = 0; i < _axisIndices.Length; i++)
+                {
+                    hash = hash * 31 + _axisIndices[i];
+                    hash = hash * 31 + _kinds[i];
+                    hash = hash * 31 + _numbers[i].GetHashCode();
+                    hash = hash * 31 + (_strings[i] == null ? 0 : StringComparer.Ordinal.GetHashCode(_strings[i]));
+                    hash = hash * 31 + (_objects[i] == null ? 0 : _objects[i].GetHashCode());
+                }
+                return hash;
+            }
+        }
 
         internal bool TryGetAxisValue<TValue>(int axisIndex, out TValue value)
         {
@@ -226,6 +306,15 @@ namespace Memory2.History
         }
     }
 
+    internal sealed class PointPatchShadowContentComparer : IEqualityComparer<PointPatchShadow>
+    {
+        internal static readonly PointPatchShadowContentComparer Instance = new PointPatchShadowContentComparer();
+        private PointPatchShadowContentComparer() { }
+        public bool Equals(PointPatchShadow x, PointPatchShadow y)
+            => ReferenceEquals(x, y) || (x != null && x.ContentEquals(y));
+        public int GetHashCode(PointPatchShadow obj) => obj == null ? 0 : obj.ContentHashCode();
+    }
+
     internal struct PointPatchFrameItem
     {
         internal long Id; internal PointPatchShadow Patch;
@@ -329,25 +418,49 @@ namespace Memory2.History
         private readonly long _population;
         private readonly ConcurrentDictionary<long, PageBlock> _blocks = new ConcurrentDictionary<long, PageBlock>();
         private readonly ConcurrentDictionary<long, byte> _patchedIds = new ConcurrentDictionary<long, byte>();
+        private static readonly PointPatchShadow CompiledTombstone = PointPatchShadow.FromTransform(NoopTransform.Instance);
+        private PatchPage[] _compiledOverrides = Array.Empty<PatchPage>();
         private readonly object[] _owners = new object[4096];
+        private readonly object _compileGate = new object();
         private readonly object _snapshotOwner = new object();
+        private CompiledAtPatchDag _compiled;
         private long[] _patchedIdSnapshot = Array.Empty<long>();
+        private long[] _overrideIdSnapshot = Array.Empty<long>();
         private long _patchedIdVersion, _snapshotVersion = -1;
+        private long _overrideSnapshotVersion = -1;
         private long _patchCount, _fieldValueCount, _framesPublished, _pageContacts, _shadowCancellations, _allocatedPages, _densePages, _payloadBytes;
+        private long _compiledAccepts, _compiledRejects, _contentVersion, _lastCompileAttemptContentVersion = -1;
+        private long _compiledOverrideCount;
 
         internal PagedPointPatchStore(long population) { _population = population < 1 ? 1 : population; for (int i = 0; i < _owners.Length; i++) _owners[i] = new object(); }
-        internal void Set(long id, PointPatchShadow patch) { Validate(id); PublishPage(id >> PageShift, new[] { new PointPatchFrameItem(id, patch) }, 0, 1); }
+        internal bool HasCompiledAtSurface => Volatile.Read(ref _compiled) != null;
+        internal int CompiledAtLength => Volatile.Read(ref _compiled)?.Length ?? 0;
+        internal void GetCompiledAtInfo(out int length, out int leaves, out int nodes)
+        {
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            length = compiled == null ? 0 : compiled.Length;
+            leaves = compiled == null ? 0 : compiled.UniqueLeafCount;
+            nodes = compiled == null ? 0 : compiled.UniqueNodeCount;
+        }
+        internal void Set(long id, PointPatchShadow patch)
+        {
+            Validate(id);
+            lock (_compileGate) PublishPage(id >> PageShift, new[] { new PointPatchFrameItem(id, patch) }, 0, 1);
+        }
         internal void PublishFrame(List<PointPatchFrameItem> items)
         {
             if (items == null || items.Count == 0) return;
-            items.Sort((a,b) => a.Id.CompareTo(b.Id));
-            var ranges = new List<PageRange>();
-            int i=0; while(i<items.Count) { long page=items[i].Id>>PageShift; int end=i+1; while(end<items.Count && (items[end].Id>>PageShift)==page) end++; ranges.Add(new PageRange(page,i,end)); i=end; }
-            if (ranges.Count >= 8 && Environment.ProcessorCount > 1)
-                System.Threading.Tasks.Parallel.For(0, ranges.Count, r => { var x=ranges[r]; PublishPage(x.Page, items, x.Start, x.End); });
-            else
-                for (int r=0;r<ranges.Count;r++) { var x=ranges[r]; PublishPage(x.Page, items, x.Start, x.End); }
-            Interlocked.Increment(ref _framesPublished);
+            lock (_compileGate)
+            {
+                items.Sort((a,b) => a.Id.CompareTo(b.Id));
+                var ranges = new List<PageRange>();
+                int i=0; while(i<items.Count) { long page=items[i].Id>>PageShift; int end=i+1; while(end<items.Count && (items[end].Id>>PageShift)==page) end++; ranges.Add(new PageRange(page,i,end)); i=end; }
+                if (ranges.Count >= 8 && Environment.ProcessorCount > 1)
+                    System.Threading.Tasks.Parallel.For(0, ranges.Count, r => { var x=ranges[r]; PublishPage(x.Page, items, x.Start, x.End); });
+                else
+                    for (int r=0;r<ranges.Count;r++) { var x=ranges[r]; PublishPage(x.Page, items, x.Start, x.End); }
+                Interlocked.Increment(ref _framesPublished);
+            }
         }
         private readonly struct PageRange
         {
@@ -359,22 +472,156 @@ namespace Memory2.History
             long blockIndex=pageIndex>>BlockPageShift; int pageOffset=(int)(pageIndex&BlockPageMask); object owner=_owners[(int)((ulong)pageIndex%(uint)_owners.Length)];
             lock(owner)
             {
-                PageBlock block=_blocks.GetOrAdd(blockIndex,_=>new PageBlock()); PatchPage page=block.Pages[pageOffset];
-                if(page==null) { page=block.Pages[pageOffset]=new SparsePatchPage(); Interlocked.Increment(ref _allocatedPages); }
+                PageBlock block = null;
+                PatchPage page = null;
+                bool contactedDeltaPage = false;
                 for(int j=start;j<end;j++)
                 {
-                    int slot=(int)(items[j].Id&PageMask); PointPatchShadow before; PatchPage promoted=page.Set(slot,items[j].Patch,out before);
+                    Interlocked.Increment(ref _contentVersion);
+                    long id = items[j].Id;
+                    PointPatchShadow requested = items[j].Patch;
+                    CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+                    if (compiled != null && compiled.Contains(id))
+                    {
+                        PatchPage[] overridePages = Volatile.Read(ref _compiledOverrides);
+                        int overridePageIndex = (int)(id >> PageShift);
+                        PatchPage overridePage = Volatile.Read(ref overridePages[overridePageIndex]);
+                        if (overridePage == null)
+                        {
+                            overridePage = new SparsePatchPage();
+                            Volatile.Write(ref overridePages[overridePageIndex], overridePage);
+                        }
+                        int overrideSlot = (int)(id & PageMask);
+                        PointPatchShadow afterOverride = requested ?? CompiledTombstone;
+                        PointPatchShadow beforeOverride;
+                        PatchPage replacement = overridePage.Set(overrideSlot, afterOverride, out beforeOverride);
+                        if (replacement != null)
+                        {
+                            overridePage = replacement;
+                            Volatile.Write(ref overridePages[overridePageIndex], overridePage);
+                        }
+                        bool compiledBeforeExists = !ReferenceEquals(beforeOverride, CompiledTombstone);
+                        int compiledBeforeFields = beforeOverride == null ? compiled.GetFieldCount(id) :
+                            ReferenceEquals(beforeOverride, CompiledTombstone) ? 0 : beforeOverride.FieldCount;
+                        if (beforeOverride == null)
+                        {
+                            Interlocked.Increment(ref _compiledOverrideCount);
+                            Interlocked.Increment(ref _patchedIdVersion);
+                        }
+                        if (beforeOverride != null && !ReferenceEquals(beforeOverride, CompiledTombstone))
+                            Interlocked.Add(ref _payloadBytes, -beforeOverride.EstimatedPayloadBytes);
+                        if (requested != null) Interlocked.Add(ref _payloadBytes, requested.EstimatedPayloadBytes);
+                        AccountLogical(compiledBeforeExists, compiledBeforeFields, requested);
+                        continue;
+                    }
+
+                    PointPatchShadow stored = requested;
+
+                    if (page == null)
+                    {
+                        block = _blocks.GetOrAdd(blockIndex, _ => new PageBlock());
+                        page = block.Pages[pageOffset];
+                        if (page == null) { page = block.Pages[pageOffset] = new SparsePatchPage(); Interlocked.Increment(ref _allocatedPages); }
+                    }
+                    contactedDeltaPage = true;
+
+                    int slot=(int)(id&PageMask); PointPatchShadow before; PatchPage promoted=page.Set(slot,stored,out before);
                     if(promoted!=null) { page=block.Pages[pageOffset]=promoted; Interlocked.Increment(ref _densePages); }
-                    Account(items[j].Id,before,items[j].Patch);
+                    bool beforeExists = before != null;
+                    int beforeFields = before == null ? 0 : before.FieldCount;
+                    AccountDelta(id,before,stored);
+                    AccountLogical(beforeExists, beforeFields, requested);
                 }
-                Interlocked.Increment(ref _pageContacts);
+                if (contactedDeltaPage) Interlocked.Increment(ref _pageContacts);
             }
         }
-        internal PointPatchShadow Get(long id)
+        private PointPatchShadow GetDelta(long id)
         {
             if(id<0||id>=_population)return null; long pageIndex=id>>PageShift; PageBlock block;
             if(!_blocks.TryGetValue(pageIndex>>BlockPageShift,out block))return null; PatchPage page=Volatile.Read(ref block.Pages[(int)(pageIndex&BlockPageMask)]);
             return page==null?null:page.Get((int)(id&PageMask));
+        }
+        private PointPatchShadow GetCompiledOverride(long id)
+        {
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled == null || !compiled.Contains(id)) return null;
+            PatchPage[] pages = Volatile.Read(ref _compiledOverrides);
+            int pageIndex = (int)(id >> PageShift);
+            if ((uint)pageIndex >= (uint)pages.Length) return null;
+            PatchPage page = Volatile.Read(ref pages[pageIndex]);
+            return page == null ? null : page.Get((int)(id & PageMask));
+        }
+        internal bool HasPatch(long id)
+        {
+            if (id < 0 || id >= _population) return false;
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) return false;
+            if (compiledOverride != null || GetDelta(id) != null) return true;
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            return compiled != null && compiled.Contains(id);
+        }
+        internal bool TryApplyCompletePointState(long id, int axisCount, object target)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) return false;
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null)
+            {
+                if (!delta.CoversAllAxes(axisCount)) return false;
+                delta.ApplyToObject(target);
+                return true;
+            }
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            return compiled != null && compiled.TryApplyComplete(id, axisCount, target);
+        }
+        internal int GetFieldCount(long id)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) return 0;
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null) return delta.FieldCount;
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            return compiled != null ? compiled.GetFieldCount(id) : 0;
+        }
+        internal void ApplyToObject(long id, object target)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) return;
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null) { delta.ApplyToObject(target); return; }
+            Volatile.Read(ref _compiled)?.ApplyToObject(id, target);
+        }
+        internal bool TryGetAxisValue<TValue>(long id, int axisIndex, out TValue value)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) { value = default(TValue); return false; }
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null) return delta.TryGetAxisValue(axisIndex, out value);
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled != null) return compiled.TryGetAxisValue(id, axisIndex, out value);
+            value = default(TValue);
+            return false;
+        }
+        internal bool TryGetAxisValue(long id, int axisIndex, out object value)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) { value = null; return false; }
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null) return delta.TryGetAxisValue(axisIndex, out value);
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled != null) return compiled.TryGetAxisValue(id, axisIndex, out value);
+            value = null;
+            return false;
+        }
+        internal bool TryEncodeAxisValue(long id, int axisIndex, out int code, out int fingerprint, out bool found)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) { code = 0; fingerprint = 0; found = false; return false; }
+            PointPatchShadow delta = compiledOverride ?? GetDelta(id);
+            if (delta != null) return delta.TryEncodeAxisValue(axisIndex, out code, out fingerprint, out found);
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled != null) return compiled.TryEncodeAxisValue(id, axisIndex, out code, out fingerprint, out found);
+            code = 0; fingerprint = 0; found = false; return false;
         }
         internal PatchPage GetPage(long pageIndex)
         {
@@ -397,10 +644,18 @@ namespace Memory2.History
             {
                 version = Volatile.Read(ref _patchedIdVersion);
                 if (_snapshotVersion == version) return _patchedIdSnapshot;
-                snapshot = new long[_patchedIds.Count];
+                CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+                int compiledCount = compiled == null ? 0 : compiled.Length;
+                snapshot = new long[checked(compiledCount + _patchedIds.Count)];
                 int count = 0;
+                if (compiled != null)
+                {
+                    for (int id = 0; id < compiled.Length; id++)
+                        if (!ReferenceEquals(GetCompiledOverride(id), CompiledTombstone)) snapshot[count++] = id;
+                }
                 foreach (KeyValuePair<long, byte> item in _patchedIds)
                 {
+                    if (compiled != null && item.Key < compiled.Length) continue;
                     if (count == snapshot.Length) Array.Resize(ref snapshot, count + 1);
                     snapshot[count++] = item.Key;
                 }
@@ -412,28 +667,153 @@ namespace Memory2.History
             }
         }
         internal long Count => Interlocked.Read(ref _patchCount);
+        internal bool TryCompile(DetermineSchema schema)
+        {
+            if (schema == null) return false;
+            if (AppContext.TryGetSwitch("Memory2.DisableCompiledAt", out bool disabled) && disabled) return false;
+            lock (_compileGate)
+            {
+                long patchCount = Interlocked.Read(ref _patchCount);
+                if (patchCount < 4096 || patchCount > int.MaxValue || !IsPowerOfFour(patchCount)) return false;
+
+                CompiledAtPatchDag currentCompiled = Volatile.Read(ref _compiled);
+                long overrideCount = Interlocked.Read(ref _compiledOverrideCount);
+                bool promotion = currentCompiled == null || patchCount > currentCompiled.Length;
+                long rebaseThreshold = currentCompiled == null ? long.MaxValue : Math.Max(4096L, currentCompiled.Length / 8L);
+                bool rebase = currentCompiled != null && patchCount == currentCompiled.Length && overrideCount >= rebaseThreshold;
+                if (!promotion && !rebase) return false;
+
+                long contentVersion = Interlocked.Read(ref _contentVersion);
+                if (contentVersion == _lastCompileAttemptContentVersion) return false;
+                _lastCompileAttemptContentVersion = contentVersion;
+
+                int length = (int)patchCount;
+                if (!CompiledAtPatchDag.TryBuild(schema, length, GetLogicalPatchForCompilation, out CompiledAtPatchDag candidate))
+                { Interlocked.Increment(ref _compiledRejects); return false; }
+
+                SurfaceMillStatistics current = GetStatistics();
+                if (candidate.EstimatedTotalBytes >= current.EstimatedTotalSurfaceBytes)
+                { Interlocked.Increment(ref _compiledRejects); return false; }
+
+                Volatile.Write(ref _compiled, candidate);
+                _blocks.Clear();
+                _patchedIds.Clear();
+                Volatile.Write(ref _compiledOverrides, new PatchPage[(candidate.Length + PageMask) >> PageShift]);
+                Interlocked.Exchange(ref _compiledOverrideCount, 0);
+                Interlocked.Exchange(ref _allocatedPages, 0);
+                Interlocked.Exchange(ref _densePages, 0);
+                Interlocked.Exchange(ref _payloadBytes, 0);
+                Interlocked.Increment(ref _patchedIdVersion);
+                Interlocked.Increment(ref _compiledAccepts);
+                return true;
+            }
+        }
+        private PointPatchShadow GetLogicalPatchForCompilation(int id)
+        {
+            PointPatchShadow compiledOverride = GetCompiledOverride(id);
+            if (ReferenceEquals(compiledOverride, CompiledTombstone)) return null;
+            if (compiledOverride != null) return compiledOverride;
+            PointPatchShadow delta = GetDelta(id);
+            if (delta != null) return delta;
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            return compiled == null ? null : compiled.ExportPatch(id);
+        }
+        internal bool TryGetCompiledAggregate(AtSolver.Plan plan, long startInclusive, long endExclusive,
+            out long count, out long checksum, out int length)
+        {
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled != null && compiled.TryGetAggregate(plan, startInclusive, endExclusive, out count, out checksum))
+            { length = compiled.Length; return true; }
+            count = 0; checksum = 0; length = 0; return false;
+        }
+        internal bool TryGetCompiledMatchingIds(AtSolver.Plan plan, long startInclusive, long endExclusive, out long[] ids, out int length)
+        {
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            if (compiled != null && compiled.TryGetMatchingIds(plan, startInclusive, endExclusive, out ids))
+            { length = compiled.Length; return true; }
+            ids = null; length = 0; return false;
+        }
+        internal bool CompiledBaseMatches(long id, AtSolver.Plan plan)
+        {
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            return compiled != null && compiled.Matches(id, plan);
+        }
+        internal long[] GetOverrideIdSnapshot()
+        {
+            long version = Volatile.Read(ref _patchedIdVersion);
+            long[] snapshot = Volatile.Read(ref _overrideIdSnapshot);
+            if (Volatile.Read(ref _overrideSnapshotVersion) == version) return snapshot;
+            lock (_snapshotOwner)
+            {
+                version = Volatile.Read(ref _patchedIdVersion);
+                if (_overrideSnapshotVersion == version) return _overrideIdSnapshot;
+                var values = new long[checked(_patchedIds.Count + (int)Interlocked.Read(ref _compiledOverrideCount))];
+                int count = 0;
+                foreach (long id in _patchedIds.Keys) values[count++] = id;
+                PatchPage[] overridePages = Volatile.Read(ref _compiledOverrides);
+                for (int pageIndex = 0; pageIndex < overridePages.Length; pageIndex++)
+                {
+                    PatchPage page = Volatile.Read(ref overridePages[pageIndex]);
+                    if (page == null) continue;
+                    long pageBase = (long)pageIndex << PageShift;
+                    for (int slot = 0; slot < PageSize; slot++)
+                        if (page.Get(slot) != null) values[count++] = pageBase + slot;
+                }
+                if (count != values.Length) Array.Resize(ref values, count);
+                Array.Sort(values);
+                Volatile.Write(ref _overrideIdSnapshot, values);
+                Volatile.Write(ref _overrideSnapshotVersion, version);
+                return values;
+            }
+        }
         internal SurfaceMillStatistics GetStatistics()
         {
             long pageBytes=0; foreach(var b in _blocks.Values) for(int i=0;i<b.Pages.Length;i++){var p=b.Pages[i]; if(p!=null)pageBytes+=p.EstimatedBytes;}
-            return new SurfaceMillStatistics(Interlocked.Read(ref _patchCount),Interlocked.Read(ref _fieldValueCount),Interlocked.Read(ref _allocatedPages),Interlocked.Read(ref _densePages),Interlocked.Read(ref _framesPublished),Interlocked.Read(ref _pageContacts),Interlocked.Read(ref _shadowCancellations),_blocks.Count,PageSize,PagesPerBlock,pageBytes,Interlocked.Read(ref _payloadBytes));
+            PatchPage[] overridePages = Volatile.Read(ref _compiledOverrides);
+            long overrideAllocatedPages = 0, overrideDensePages = 0;
+            pageBytes += overridePages.Length * (long)IntPtr.Size;
+            for (int i = 0; i < overridePages.Length; i++)
+            {
+                PatchPage page = Volatile.Read(ref overridePages[i]);
+                if (page == null) continue;
+                pageBytes += page.EstimatedBytes;
+                overrideAllocatedPages++;
+                if (page.IsDense) overrideDensePages++;
+            }
+            CompiledAtPatchDag compiled = Volatile.Read(ref _compiled);
+            long compiledStructure = compiled == null ? 0 : compiled.EstimatedStructureBytes;
+            long compiledPayload = compiled == null ? 0 : compiled.EstimatedPayloadBytes;
+            return new SurfaceMillStatistics(Interlocked.Read(ref _patchCount),Interlocked.Read(ref _fieldValueCount),Interlocked.Read(ref _allocatedPages) + overrideAllocatedPages,Interlocked.Read(ref _densePages) + overrideDensePages,Interlocked.Read(ref _framesPublished),Interlocked.Read(ref _pageContacts),Interlocked.Read(ref _shadowCancellations),_blocks.Count,PageSize,PagesPerBlock,pageBytes + compiledStructure,Interlocked.Read(ref _payloadBytes) + compiledPayload,
+                compiled != null, compiled == null ? 0 : compiled.Length, compiled == null ? 0 : compiled.UniqueLeafCount,
+                compiled == null ? 0 : compiled.UniqueNodeCount, Interlocked.Read(ref _compiledAccepts), Interlocked.Read(ref _compiledRejects));
         }
-        private void Account(long id, PointPatchShadow before, PointPatchShadow after)
+        private void AccountDelta(long id, PointPatchShadow before, PointPatchShadow after)
         {
             if(before==null&&after!=null)
             {
                 _patchedIds.TryAdd(id, 0);
                 Interlocked.Increment(ref _patchedIdVersion);
-                Interlocked.Increment(ref _patchCount);
             }
             else if(before!=null&&after==null)
             {
                 _patchedIds.TryRemove(id, out _);
                 Interlocked.Increment(ref _patchedIdVersion);
-                Interlocked.Decrement(ref _patchCount);
-                Interlocked.Increment(ref _shadowCancellations);
             }
-            if(before!=null){Interlocked.Add(ref _fieldValueCount,-before.FieldCount);Interlocked.Add(ref _payloadBytes,-before.EstimatedPayloadBytes);}
-            if(after!=null){Interlocked.Add(ref _fieldValueCount,after.FieldCount);Interlocked.Add(ref _payloadBytes,after.EstimatedPayloadBytes);}
+            if(before!=null) Interlocked.Add(ref _payloadBytes,-before.EstimatedPayloadBytes);
+            if(after!=null) Interlocked.Add(ref _payloadBytes,after.EstimatedPayloadBytes);
+        }
+        private void AccountLogical(bool beforeExists, int beforeFields, PointPatchShadow after)
+        {
+            bool afterExists = after != null;
+            if (!beforeExists && afterExists) Interlocked.Increment(ref _patchCount);
+            else if (beforeExists && !afterExists) { Interlocked.Decrement(ref _patchCount); Interlocked.Increment(ref _shadowCancellations); }
+            Interlocked.Add(ref _fieldValueCount, (after == null ? 0 : after.FieldCount) - beforeFields);
+        }
+        private static bool IsPowerOfFour(long value)
+        {
+            if (value < 1) return false;
+            while ((value & 3L) == 0) value >>= 2;
+            return value == 1;
         }
         private void Validate(long id){if(id<0||id>=_population)throw new ArgumentOutOfRangeException(nameof(id));}
     }
@@ -442,7 +822,8 @@ namespace Memory2.History
     {
         public long PointPatchCount{get;} public long PatchedFieldValueCount{get;} public long AllocatedPatchPages{get;} public long DensePatchPages{get;} public long SparsePatchPages=>AllocatedPatchPages-DensePatchPages;
         public long FramesPublished{get;} public long PageContacts{get;} public long ShadowCancellations{get;} public int AllocatedDirectoryBlocks{get;} public int PageSize{get;} public int PagesPerDirectoryBlock{get;}
+        public bool HasCompiledAtSurface{get;} public int CompiledAtLength{get;} public int CompiledAtUniqueLeaves{get;} public int CompiledAtUniqueNodes{get;} public long CompiledAtAccepts{get;} public long CompiledAtRejects{get;}
         public long EstimatedDirectoryBytes=>AllocatedDirectoryBlocks*(long)PagesPerDirectoryBlock*IntPtr.Size; public long EstimatedPageSlotBytes{get;} public long EstimatedPatchPayloadBytes{get;} public long EstimatedTotalSurfaceBytes=>EstimatedDirectoryBytes+EstimatedPageSlotBytes+EstimatedPatchPayloadBytes;
-        internal SurfaceMillStatistics(long patches,long fields,long pages,long dense,long frames,long contacts,long cancellations,int blocks,int pageSize,int pagesPerBlock,long pageBytes,long payloadBytes){PointPatchCount=patches;PatchedFieldValueCount=fields;AllocatedPatchPages=pages;DensePatchPages=dense;FramesPublished=frames;PageContacts=contacts;ShadowCancellations=cancellations;AllocatedDirectoryBlocks=blocks;PageSize=pageSize;PagesPerDirectoryBlock=pagesPerBlock;EstimatedPageSlotBytes=pageBytes;EstimatedPatchPayloadBytes=payloadBytes;}
+        internal SurfaceMillStatistics(long patches,long fields,long pages,long dense,long frames,long contacts,long cancellations,int blocks,int pageSize,int pagesPerBlock,long pageBytes,long payloadBytes,bool hasCompiledAt=false,int compiledLength=0,int compiledLeaves=0,int compiledNodes=0,long compiledAccepts=0,long compiledRejects=0){PointPatchCount=patches;PatchedFieldValueCount=fields;AllocatedPatchPages=pages;DensePatchPages=dense;FramesPublished=frames;PageContacts=contacts;ShadowCancellations=cancellations;AllocatedDirectoryBlocks=blocks;PageSize=pageSize;PagesPerDirectoryBlock=pagesPerBlock;EstimatedPageSlotBytes=pageBytes;EstimatedPatchPayloadBytes=payloadBytes;HasCompiledAtSurface=hasCompiledAt;CompiledAtLength=compiledLength;CompiledAtUniqueLeaves=compiledLeaves;CompiledAtUniqueNodes=compiledNodes;CompiledAtAccepts=compiledAccepts;CompiledAtRejects=compiledRejects;}
     }
 }

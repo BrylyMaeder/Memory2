@@ -6,6 +6,10 @@ Store enormous connected systems. Query them with LINQ. Change live state. Keep 
 
 The native engine is `LawfulMemoryStore<TRoot>`: a fixed-shape column store with arithmetic descendant coordinates, prepared zero-allocation queries, compact persistence, and selective hydration. `MemoryStore` is the flexible compatibility facade for dynamic object graphs. Performance claims apply to the native lawful engine unless a result explicitly names another surface.
 
+See [CAPABILITIES.md](CAPABILITIES.md) for the complete implemented capability inventory, engine-surface distinctions, measured proof, and current boundaries. The adaptive shared-DAG physical plan beneath the existing `AT` API is documented in [COMPILED_AT.md](COMPILED_AT.md).
+
+Copyright © 2026 Bryly Maeder. Memory2 is open-source software released under the [MIT License](LICENSE).
+
 ## Current measured proof
 
 On the repository's comparative Release runner, Memory2 currently measures:
@@ -17,6 +21,10 @@ On the repository's comparative Release runner, Memory2 currently measures:
 - zero bytes allocated by all measured Memory2 hot paths.
 
 These are same-process measurements over equal values on the documented machine. They are not presented as Redis results. See [BENCHMARKS.md](BENCHMARKS.md) for hardware, methodology, proof thresholds, limitations, and the exact reproduction command.
+
+The low-level `Collection<T>` engine also has an adaptive compiled physical plan beneath the existing `AT` API. On the final five-process, 262,144-record proof it reduced the patch-heavy engine surface by **124.31x**, improved public point reads by **1.51x**, prepared exact counts by **83,963x**, and compound LINQ by **8.50x** in a separate 15-trial control. Exact semantics survived writes, bounded queries, parallel access, epochs, synchronization, and bulk rebasing. See [COMPILED_AT.md](COMPILED_AT.md) for the exact workloads and important boundaries.
+
+The high-level lawful engine now compiles application intent into coordinate motion. In the five-process proof, a prepared two-column LINQ update had a **1.08 ns per selected-row median** and a **407.04x paired median speedup** over hydrating the same event and metadata, mutating the POCO, and calling `Save`, with zero allocation and exact live-query transitions. Compiled six-object graph creation was **3.40x faster** and avoided **712 bytes per root**. See [COORDINATE_INTENT.md](COORDINATE_INTENT.md) for the API, exact workload, and boundaries.
 
 ## Relational AT: search without a stored index
 
@@ -54,11 +62,13 @@ This guide covers Memory2's high-level C# API.
 ## Contents
 
 - [Install](#install)
+- [Licensing](#licensing)
 - [Open a store](#open-a-store)
 - [Relational AT: search without a stored index](#relational-at-search-without-a-stored-index)
 - [Define models](#define-models)
 - [Work with sets](#work-with-sets)
 - [Create data](#create-data)
+- [Compile graph creation](#compile-graph-creation)
 - [Read data](#read-data)
 - [Hydrate query results](#hydrate-query-results)
 - [Query with LINQ](#query-with-linq)
@@ -67,6 +77,7 @@ This guide covers Memory2's high-level C# API.
 - [Find the parent or root](#find-the-parent-or-root)
 - [Save an inner object directly](#save-an-inner-object-directly)
 - [Update and upsert](#update-and-upsert)
+- [Compile a LINQ update](#compile-a-linq-update)
 - [Delete data](#delete-data)
 - [Subscribe to live conditions](#subscribe-to-live-conditions)
 - [Synchronize changes](#synchronize-changes)
@@ -93,6 +104,12 @@ Then import the namespace:
 ```csharp
 using Memory2;
 ```
+
+## Licensing
+
+Memory2 is open source under the MIT License. You may use it privately or commercially, modify it, redistribute it, sublicense it, and include it in products. Copies or substantial portions must retain the copyright and MIT permission notice.
+
+See [LICENSING.md](LICENSING.md) for a short summary and [LICENSE](LICENSE) for the controlling terms.
 
 ---
 
@@ -247,6 +264,28 @@ Vehicle vehicle = vehicles.Create(new Vehicle
     }
 });
 ```
+
+### Compile graph creation
+
+When a fixed expression is the source of a lawful graph, compile it directly into the typed columns instead of constructing a throwaway POCO graph for every root:
+
+```csharp
+var create = lawful.Set().PrepareCreate(i => new Account
+{
+    Name = "account-" + i,
+    Active = true,
+    Profile = new Profile { RiskBand = i & 7 },
+    Events = new List<AccountEvent>
+    {
+        new AccountEvent { Sequence = i * 2L + 1 },
+        new AccountEvent { Sequence = i * 2L + 2 }
+    }
+});
+
+create.Execute(ordinalStart: 0, count: 100_000);
+```
+
+The owned shape and collection cardinalities are verified during preparation. Execution assigns IDs and writes every scalar coordinate without constructing roots, children, or collections. Values explicitly created by the expression, such as new strings, retain their normal cost.
 
 ---
 
@@ -553,6 +592,24 @@ Save the tracked object returned by Memory2. A newly constructed object with sim
 ---
 
 ## Update and upsert
+
+### Compile a LINQ update
+
+The native lawful query surface can update selected rows without hydrating them:
+
+```csharp
+var accept = lawful.From<PaymentEvent>()
+    .Where(x => x.Pending && x.Amount >= 10_000)
+    .PrepareUpdate(x => new PaymentEvent
+    {
+        Attempts = x.Attempts + 1,
+        Pending = false
+    });
+
+int updated = accept.Execute();
+```
+
+The initializer is partial: assigned scalar properties change and omitted properties remain untouched. Every right-hand side reads the old row. The prepared selection can be executed repeatedly, performs no model materialization, and continues to publish exact changes to live LINQ subscriptions.
 
 ### Update a loaded root
 
@@ -1126,6 +1183,16 @@ set.Load(id)
 set.Upsert(model)
 set.Delete(id)
 set.Subscribe(predicate, handler)
+```
+
+### Native lawful coordinate intent
+
+```csharp
+lawful.Set().PrepareCreate(i => new Root { ... })
+lawful.Set().CreateMany(count, i => new Root { ... })
+lawful.From<T>().Where(...).PrepareUpdate(x => new T { ... })
+lawful.From<T>().Where(...).Update(x => new T { ... })
+lawful.From<T>().Where(...).ExecuteUpdate(x => new T { ... })
 ```
 
 ### Queries

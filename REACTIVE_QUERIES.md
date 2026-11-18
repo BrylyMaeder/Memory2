@@ -89,7 +89,7 @@ The reactive LINQ path inverts the operation:
 
 1. Expression preparation records every scalar column read by the query predicate and projection.
 2. Each scalar column owns a list of subscriptions that can observe it.
-3. `Save` compares incoming model values directly with typed column values without boxing.
+3. `Save` compares incoming model values directly with typed column values without boxing; a compiled coordinate update compares only the scalar assignments in its prepared expression.
 4. Only lists belonging to changed columns are visited.
 5. A dispatch epoch deduplicates a query that depends on several simultaneously changed columns.
 6. The query captures its membership and projection before the write.
@@ -115,7 +115,7 @@ dotnet run --configuration Release --project PerformanceLab -- \
   --reactive-proof --subscriptions 500 --operations 1000000
 ```
 
-Measured on the repository's documented Windows/.NET machine:
+Re-measured November 17, 2026 on the repository's documented Windows/.NET machine:
 
 | Measurement | Result |
 | --- | ---: |
@@ -124,11 +124,13 @@ Measured on the repository's documented Windows/.NET machine:
 | Naïvely extended scan-every-query evaluations | 1,000,000,000 |
 | Dependency-routed evaluations | 2,000,000 |
 | Evaluation reduction | **500.0x** |
-| Throughput | 3,048,503 writes/sec |
+| Throughput | 3,462,552 writes/sec |
 | Measured hot-path allocation | 0 bytes |
 | GC collections | 0 / 0 / 0 |
 
 The proof uses 499 queries dependent on `Score` and one dependent on `Active`, then changes only `Active`. A naïve extension of the former scan algorithm would evaluate all 500 queries before and after every write; the former implementation itself capped registrations at 64. Dependency routing evaluates the single affected query before and after. The 500x figure describes eliminated predicate evaluations for this declared workload; it is not a universal throughput multiplier.
+
+The separate compiled-coordinate proof updates 16,384 selected rows through `PrepareUpdate`, with an active projected query, and verifies exactly 16,384 transitions without hydrating a model. Subscription observation deliberately uses the per-coordinate before/after path; the 1.08 ns prepared bulk-update median reported in `COORDINATE_INTENT.md` is the no-subscription path and is not presented as reactive write latency.
 
 ## Conditional computation
 
@@ -154,7 +156,7 @@ The implemented native path supports:
 - scalar or constructed `Select` projections;
 - entry-only `Subscribe(Action<T>)`;
 - detailed `SubscribeChanges(Action<LawfulQueryChange<T>>)`;
-- dependency routing for `Save` and lawful scalar `Apply`;
+- dependency routing for `Save`, lawful scalar `Apply`, and compiled coordinate updates;
 - more than 64 subscriptions;
 - reentrant write-back from a consequence without losing sibling or nested transitions;
 - allocation-free value-type projections on the measured write path.

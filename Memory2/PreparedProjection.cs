@@ -145,6 +145,12 @@ namespace Memory2
 
         private void ProjectManyPageGroupedCore(long[] ids, TResult[] destination, BatchProjectionScratch scratch)
         {
+            if (_table.HasCompiledAtSurface)
+            {
+                for (int i = 0; i < ids.Length; i++) destination[i] = _selectiveProjector(ids[i]);
+                unchecked { _batchGeneratedItems += ids.Length; }
+                return;
+            }
             const int pageShift = 10;
             const int pageMask = (1 << pageShift) - 1;
             scratch.Prepare(ids, pageShift);
@@ -174,6 +180,12 @@ namespace Memory2
 
         private void ProjectManyPageAware(long[] ids, TResult[] destination)
         {
+            if (_table.HasCompiledAtSurface)
+            {
+                for (int item = 0; item < ids.Length; item++) destination[item] = _selectiveProjector(ids[item]);
+                unchecked { _batchGeneratedItems += ids.Length; }
+                return;
+            }
             const int pageShift = 10;
             const int pageMask = (1 << pageShift) - 1;
             int i = 0;

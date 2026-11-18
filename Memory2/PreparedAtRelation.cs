@@ -82,7 +82,7 @@ namespace Memory2
         public long ChecksumIds(long startInclusive, long endExclusive)
             => _table.ChecksumRelationIds(CurrentPlan(), startInclusive, endExclusive);
 
-        public AtExplain Explain() => CurrentPlan().Explain;
+        public AtExplain Explain() => _table.ExplainRelation(CurrentPlan());
 
         private AtSolver.Plan CurrentPlan()
         {

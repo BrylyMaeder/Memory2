@@ -110,6 +110,7 @@ namespace Memory2
             var frame = new List<PointPatchFrameItem>(models.Count);
             for (int i = 0; i < captured.Length; i++) if (valid[i]) frame.Add(captured[i]);
             _commitIndex.AddPointPatchFrame(frame);
+            _commitIndex.TryCompilePointPatches(_schema);
             Interlocked.Increment(ref _mutationVersion);
             if (before != null)
                 for (int i = 0; i < before.Count; i++) PublishSubscriptionChanges(before[i].Key, before[i].Value, Get(before[i].Key), subscriptions);
@@ -138,6 +139,7 @@ namespace Memory2
             => _schema.TryGetAxisIndex(propertyName, out axisIndex);
 
         internal bool HasNonPointCommits => _commitIndex.HasNonPointCommits;
+        internal bool HasCompiledAtSurface => _commitIndex.HasCompiledAtSurface;
 
         internal TValue ReadProjectedIdValue<TValue>(long id)
         {
@@ -171,9 +173,6 @@ namespace Memory2
             return _projector.DetermineAxisValue<TValue>(id, axisIndex);
         }
 
-        internal PointPatchShadow GetPointPatch(long id)
-            => _commitIndex.GetPointPatch(id);
-
         internal PatchPage GetPointPatchPage(long pageIndex)
             => _commitIndex.GetPointPatchPage(pageIndex);
 
@@ -198,7 +197,14 @@ namespace Memory2
         public T Get(long id)
         {
             if (id < 0 || id >= _population) return new T();
-            var obj = _projector.DetermineBase(id);
+            T obj;
+            if (_commitIndex.HasCompiledAtSurface)
+            {
+                obj = _projector.CreateShell(id);
+                if (!_commitIndex.HasNonPointCommits && _commitIndex.TryApplyCompletePointState(id, _schema.AxisCount, obj)) return obj;
+                _projector.PopulateGeneratedAxes(obj, id);
+            }
+            else obj = _projector.DetermineBase(id);
             _commitIndex.ApplyToObject(id, obj);
             return obj;
         }
@@ -211,6 +217,9 @@ namespace Memory2
         {
             if (terms == null || terms.Count == 0) throw new ArgumentException("AT requires terms.", nameof(terms));
             var plan = GetAtShadow(terms, options);
+            int compiledLength = _commitIndex.CompiledAtLength;
+            if (compiledLength > 0 && TryResolveCompiledRelationIds(plan, 0, compiledLength, out long[] compiledIds) && compiledIds.Length != 0)
+                return compiledIds[0];
             long first = -1;
             foreach (var id in plan.GenerateIds())
             {
@@ -249,6 +258,17 @@ namespace Memory2
         {
             if (terms == null || terms.Count == 0) throw new ArgumentException("AT requires terms.", nameof(terms));
             var plan = GetAtShadow(terms, atOptions);
+            long compiledStart = Math.Max(0, startInclusive ?? 0);
+            long compiledEnd = Math.Min(_population, endExclusive ?? _population);
+            if (TryResolveCompiledRelationIds(plan, compiledStart, compiledEnd, out long[] compiledIds))
+            {
+                for (int i = 0; i < compiledIds.Length; i++)
+                {
+                    T item = Get(compiledIds[i]);
+                    if (residualPredicate == null || residualPredicate(item)) yield return item;
+                }
+                yield break;
+            }
             if (_commitIndex.HasNonPointCommits)
             {
                 long scanStart = Math.Max(0, startInclusive ?? 0);
@@ -290,10 +310,19 @@ namespace Memory2
         internal AtSolver.Plan PrepareRelation(IReadOnlyList<AtConstraintTerm> terms, AtQueryOptions options)
             => GetRelationShadow(terms, options);
 
+        internal AtExplain ExplainRelation(AtSolver.Plan plan)
+        {
+            if (plan == null) throw new ArgumentNullException(nameof(plan));
+            DecoratePhysicalPlan(plan);
+            return plan.Explain;
+        }
+
         internal long ResolveFirstRelationId(AtSolver.Plan plan, long startInclusive, long? endExclusive)
         {
             if (plan == null) throw new ArgumentNullException(nameof(plan));
             long end = NormalizeRelationRange(startInclusive, endExclusive ?? _population);
+            if (TryResolveCompiledRelationIds(plan, startInclusive, end, out long[] compiledIds))
+                return compiledIds.Length == 0 ? -1 : compiledIds[0];
             if (_commitIndex.HasNonPointCommits)
             {
                 for (long id = startInclusive; id < end; id++) if (MatchesRelation(id, plan)) return id;
@@ -303,8 +332,8 @@ namespace Memory2
             long first = -1;
             foreach (long id in plan.GenerateIds(startInclusive, end))
             {
-                PointPatchShadow patch = _commitIndex.GetPointPatch(id);
-                if ((plan.GeneratedCandidatesAreExact && patch == null) || MatchesRelation(id, plan))
+                bool patched = _commitIndex.HasPointPatch(id);
+                if ((plan.GeneratedCandidatesAreExact && !patched) || MatchesRelation(id, plan))
                 { first = id; break; }
             }
             foreach (long id in _commitIndex.EnumeratePointPatchIds())
@@ -319,6 +348,11 @@ namespace Memory2
         {
             if (plan == null) throw new ArgumentNullException(nameof(plan));
             NormalizeRelationRange(startInclusive, endExclusive);
+            if (TryResolveCompiledRelationIds(plan, startInclusive, endExclusive, out long[] compiledIds))
+            {
+                for (int i = 0; i < compiledIds.Length; i++) yield return compiledIds[i];
+                yield break;
+            }
             bool fastGenerated = plan.GeneratedCandidatesAreExact && !_commitIndex.HasNonPointCommits;
             if (_commitIndex.HasNonPointCommits)
             {
@@ -335,8 +369,8 @@ namespace Memory2
 
             foreach (long id in plan.GenerateIds(startInclusive, endExclusive))
             {
-                PointPatchShadow patch = _commitIndex.GetPointPatch(id);
-                if (fastGenerated && patch == null) yield return id;
+                bool patched = _commitIndex.HasPointPatch(id);
+                if (fastGenerated && !patched) yield return id;
                 else if (MatchesRelation(id, plan)) yield return id;
             }
             foreach (long id in _commitIndex.EnumeratePointPatchIds())
@@ -359,6 +393,22 @@ namespace Memory2
 
             long count = plan.CountGeneratedIds(startInclusive, endExclusive);
             if (_commitIndex.PointPatchCount == 0) return count;
+            if (_commitIndex.TryGetCompiledAggregate(plan, startInclusive, endExclusive,
+                out long compiledCount, out _, out int compiledLength))
+            {
+                long outsideStart = Math.Max(startInclusive, compiledLength);
+                count = checked(compiledCount + plan.CountGeneratedIds(outsideStart, endExclusive));
+                long[] overrides = _commitIndex.GetPointOverrideIdsSnapshot();
+                for (int overrideIndex = 0; overrideIndex < overrides.Length; overrideIndex++)
+                {
+                    long id = overrides[overrideIndex];
+                    if (id < startInclusive || id >= endExclusive) continue;
+                    bool baselineMatch = id < compiledLength ? _commitIndex.CompiledBaseMatches(id, plan) : plan.Generates(id);
+                    bool patchedMatch = MatchesRelation(id, plan);
+                    if (baselineMatch != patchedMatch) count += patchedMatch ? 1L : -1L;
+                }
+                return count;
+            }
             long[] patches = _commitIndex.GetPointPatchIdsSnapshot();
             for (int patchIndex = 0; patchIndex < patches.Length; patchIndex++)
             {
@@ -384,6 +434,22 @@ namespace Memory2
 
             long checksum = plan.ChecksumGeneratedIds(startInclusive, endExclusive);
             if (_commitIndex.PointPatchCount == 0) return checksum;
+            if (_commitIndex.TryGetCompiledAggregate(plan, startInclusive, endExclusive,
+                out _, out long compiledChecksum, out int compiledLength))
+            {
+                long outsideStart = Math.Max(startInclusive, compiledLength);
+                checksum = unchecked(compiledChecksum + plan.ChecksumGeneratedIds(outsideStart, endExclusive));
+                long[] overrides = _commitIndex.GetPointOverrideIdsSnapshot();
+                for (int overrideIndex = 0; overrideIndex < overrides.Length; overrideIndex++)
+                {
+                    long id = overrides[overrideIndex];
+                    if (id < startInclusive || id >= endExclusive) continue;
+                    bool baselineMatch = id < compiledLength ? _commitIndex.CompiledBaseMatches(id, plan) : plan.Generates(id);
+                    bool patchedMatch = MatchesRelation(id, plan);
+                    if (baselineMatch != patchedMatch) checksum = patchedMatch ? unchecked(checksum + id) : unchecked(checksum - id);
+                }
+                return checksum;
+            }
             long[] patches = _commitIndex.GetPointPatchIdsSnapshot();
             for (int patchIndex = 0; patchIndex < patches.Length; patchIndex++)
             {
@@ -398,28 +464,24 @@ namespace Memory2
 
         private bool MatchesRelation(long id, AtSolver.Plan plan)
         {
-            PointPatchShadow patch = _commitIndex.GetPointPatch(id);
             for (int i = 0; i < plan.Expected.Length; i++)
             {
                 AtSolver.ExpectedTerm term = plan.Expected[i];
                 if (term.AxisIndex < 0 || term.Alternatives.Length == 0) return false;
 
                 int code, fingerprint;
-                if (patch != null)
+                bool found;
+                if (_commitIndex.TryEncodePointPatchAxisValue(id, term.AxisIndex, out code, out fingerprint, out found))
                 {
-                    bool found;
-                    if (patch.TryEncodeAxisValue(term.AxisIndex, out code, out fingerprint, out found))
-                    {
-                        if (!term.Matches(code, fingerprint)) return false;
-                        continue;
-                    }
-                    if (found)
-                    {
-                        // Opaque legacy transforms cannot expose individual values.
-                        T materialized = _projector.DetermineBase(id);
-                        _commitIndex.ApplyToObject(id, materialized);
-                        return AtSolver.MatchesAllTerms(_schema, materialized, plan.Expected);
-                    }
+                    if (!term.Matches(code, fingerprint)) return false;
+                    continue;
+                }
+                if (found)
+                {
+                    // Opaque legacy transforms cannot expose individual values.
+                    T materialized = _projector.DetermineBase(id);
+                    _commitIndex.ApplyToObject(id, materialized);
+                    return AtSolver.MatchesAllTerms(_schema, materialized, plan.Expected);
                 }
 
                 if (!_projector.TryEncodeGeneratedAxisValue(id, term.AxisIndex, out code, out fingerprint))
@@ -430,6 +492,53 @@ namespace Memory2
                 }
                 if (!term.Matches(code, fingerprint)) return false;
             }
+            return true;
+        }
+
+        private bool TryResolveCompiledRelationIds(AtSolver.Plan plan, long startInclusive, long endExclusive, out long[] ids)
+        {
+            ids = null;
+            if (!plan.GeneratedCandidatesAreExact || _commitIndex.HasNonPointCommits) return false;
+            if (!_commitIndex.TryGetCompiledMatchingIds(plan, startInclusive, endExclusive, out long[] compiledBaseIds, out int compiledLength))
+                return false;
+
+            long[] overrides = _commitIndex.GetPointOverrideIdsSnapshot();
+            var results = new List<long>(compiledBaseIds.Length + Math.Min(overrides.Length, 1024));
+            for (int i = 0; i < compiledBaseIds.Length; i++)
+            {
+                long id = compiledBaseIds[i];
+                if (Array.BinarySearch(overrides, id) < 0) results.Add(id);
+            }
+
+            for (int i = 0; i < overrides.Length; i++)
+            {
+                long id = overrides[i];
+                if (id < startInclusive || id >= endExclusive || id >= compiledLength) continue;
+                if (MatchesRelation(id, plan)) results.Add(id);
+            }
+
+            long outsideStart = Math.Max(startInclusive, compiledLength);
+            foreach (long id in plan.GenerateIds(outsideStart, endExclusive))
+            {
+                if (Array.BinarySearch(overrides, id) >= 0)
+                {
+                    if (MatchesRelation(id, plan)) results.Add(id);
+                }
+                else results.Add(id);
+            }
+            for (int i = 0; i < overrides.Length; i++)
+            {
+                long id = overrides[i];
+                if (id < outsideStart || id >= endExclusive || plan.Generates(id)) continue;
+                if (MatchesRelation(id, plan)) results.Add(id);
+            }
+
+            results.Sort();
+            int write = 0;
+            for (int read = 0; read < results.Count; read++)
+                if (write == 0 || results[read] != results[write - 1]) results[write++] = results[read];
+            if (write != results.Count) results.RemoveRange(write, results.Count - write);
+            ids = results.ToArray();
             return true;
         }
 
@@ -587,11 +696,14 @@ namespace Memory2
             if (_atShadows.TryGetValue(key, out plan))
             {
                 System.Threading.Interlocked.Increment(ref _atShadowHits);
+                DecoratePhysicalPlan(plan);
                 return plan;
             }
             System.Threading.Interlocked.Increment(ref _atShadowMisses);
             plan = AtSolver.Compile(_schema, _population, terms, options, epochCodeMask);
-            return _atShadows.GetOrAdd(key, plan);
+            plan = _atShadows.GetOrAdd(key, plan);
+            DecoratePhysicalPlan(plan);
+            return plan;
         }
 
         private AtSolver.Plan GetRelationShadow(IReadOnlyList<AtConstraintTerm> terms, AtQueryOptions options)
@@ -602,12 +714,26 @@ namespace Memory2
             if (_atShadows.TryGetValue(key, out AtSolver.Plan existing))
             {
                 Interlocked.Increment(ref _atShadowHits);
+                DecoratePhysicalPlan(existing);
                 return existing;
             }
             Interlocked.Increment(ref _atShadowMisses);
             AtSolver.Plan created = AtSolver.Compile(_schema, _population, terms, options, epochCodeMask,
                 (axisIndex, code, fingerprint) => GeneratedAxisMatches(axisIndex, code, fingerprint));
-            return _atShadows.GetOrAdd(key, created);
+            created = _atShadows.GetOrAdd(key, created);
+            DecoratePhysicalPlan(created);
+            return created;
+        }
+
+        private void DecoratePhysicalPlan(AtSolver.Plan plan)
+        {
+            _commitIndex.GetCompiledAtInfo(out int length, out int leaves, out int nodes);
+            plan.Explain.CompiledAtLength = length;
+            plan.Explain.CompiledAtUniqueLeaves = leaves;
+            plan.Explain.CompiledAtUniqueNodes = nodes;
+            plan.Explain.PhysicalPlan = length != 0
+                ? "AffineAt+SharedDag+SparseOverrides"
+                : _commitIndex.PointPatchCount != 0 ? "AffineAt+PointPatches" : "AffineAt";
         }
 
         private bool GeneratedAxisMatches(int axisIndex, int code, int fingerprint)

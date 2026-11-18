@@ -6,7 +6,9 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace Memory2
 {
@@ -82,9 +84,11 @@ namespace Memory2
         public LawfulRelationshipDefinition Incoming;
         public int CardinalityFromParent;
         public int ItemsPerRoot;
+        public int Ordinal;
         public int OffsetWithinRoot;
         public List<LawfulNodeShape> Children = new List<LawfulNodeShape>();
         public List<LawfulScalarColumn> Scalars = new List<LawfulScalarColumn>();
+        public Action<int, object> WriteScalars;
     }
 
     internal sealed class LawfulSchema
@@ -129,6 +133,8 @@ namespace Memory2
                     if (GraphObject.IsScalar(property.PropertyType) && (includedScalars == null || includedScalars.Contains(property))) shape.Scalars.Add(new LawfulScalarColumn(property, checked(initialRootCapacity * shape.ItemsPerRoot)));
                 }
             }
+            int ordinal = 0;
+            foreach (LawfulNodeShape shape in _byType.Values) shape.Ordinal = ordinal++;
         }
         public int AllocatedRootCapacity { get; private set; }
         public void EnsureRootCapacity(int requiredRoots)
@@ -253,12 +259,16 @@ namespace Memory2
             if (typed == null) throw new InvalidOperationException("Column storage type does not match " + typeof(T).FullName + ".");
             return typed;
         }
+        private bool[] GetHasValueArray() => _hasValue;
         public T ReadTyped<T>(int index)
         {
             if (_values is T[] typed) return typed[index];
             object value = Read(index);
             return value == null ? default(T) : (T)value;
         }
+
+        private T? ReadNullableValue<T>(int index) where T : struct
+            => _hasValue[index] ? ((T[])_values)[index] : (T?)null;
         public object Read(int index)
         {
             if (_hasValue != null && !_hasValue[index]) return null;
@@ -420,6 +430,38 @@ namespace Memory2
         }
     }
 
+    internal sealed class LawfulCompiledCoordinateUpdate
+    {
+        internal LawfulCompiledCoordinateUpdate(
+            LawfulScalarColumn[] columns,
+            Func<int, bool>[] changed,
+            Action<int> write,
+            Action<int[], int, int> bulkWrite)
+        {
+            Columns = columns;
+            Changed = changed;
+            Write = write;
+            BulkWrite = bulkWrite;
+        }
+
+        internal readonly LawfulScalarColumn[] Columns;
+        internal readonly Func<int, bool>[] Changed;
+        internal readonly Action<int> Write;
+        internal readonly Action<int[], int, int> BulkWrite;
+    }
+
+    internal sealed class LawfulCompiledCoordinateCreate
+    {
+        internal LawfulCompiledCoordinateCreate(Action<int, int, int> write, int assignedScalarCount)
+        {
+            Write = write;
+            AssignedScalarCount = assignedScalarCount;
+        }
+
+        internal readonly Action<int, int, int> Write;
+        internal readonly int AssignedScalarCount;
+    }
+
     internal readonly struct LawfulObjectIdentity
     {
         public LawfulObjectIdentity(LawfulNodeShape shape, int rootIndex, int localIndex)
@@ -427,6 +469,246 @@ namespace Memory2
         public LawfulNodeShape Shape { get; }
         public int RootIndex { get; }
         public int LocalIndex { get; }
+    }
+
+    internal sealed class WeakIdentityMap
+    {
+        private const int StripeCount = 16;
+        private readonly Stripe[] _stripes = new Stripe[StripeCount];
+        private readonly LawfulNodeShape[] _shapes;
+        private int _disposed;
+
+        internal WeakIdentityMap(LawfulNodeShape[] shapes)
+        {
+            _shapes = shapes ?? throw new ArgumentNullException(nameof(shapes));
+            for (int i = 0; i < _stripes.Length; i++) _stripes[i] = new Stripe(64);
+        }
+
+        ~WeakIdentityMap() => Dispose();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal bool TryGetValue(object key, out LawfulObjectIdentity identity)
+        {
+            int hash = IdentityHash(key);
+            Stripe stripe = _stripes[hash & (StripeCount - 1)];
+            if (!stripe.TryGetValueSynchronized(key, hash, out long token))
+            {
+                identity = default(LawfulObjectIdentity);
+                return false;
+            }
+            int shapeOrdinal = (int)(token >> 32);
+            int coordinate = unchecked((int)(uint)token);
+            LawfulNodeShape shape = _shapes[shapeOrdinal];
+            int rootIndex = coordinate / shape.ItemsPerRoot;
+            identity = new LawfulObjectIdentity(shape, rootIndex, coordinate - rootIndex * shape.ItemsPerRoot);
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void Set(object key, LawfulObjectIdentity identity)
+        {
+            int hash = IdentityHash(key);
+            Stripe stripe = _stripes[hash & (StripeCount - 1)];
+            int coordinate = checked(identity.RootIndex * identity.Shape.ItemsPerRoot + identity.LocalIndex);
+            long token = ((long)identity.Shape.Ordinal << 32) | (uint)coordinate;
+            stripe.SetSynchronized(key, hash, token);
+        }
+
+        internal void Remove(object key)
+        {
+            int hash = IdentityHash(key);
+            Stripe stripe = _stripes[hash & (StripeCount - 1)];
+            stripe.RemoveSynchronized(key, hash);
+        }
+
+        internal void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            for (int i = 0; i < _stripes.Length; i++) _stripes[i].Dispose();
+            GC.SuppressFinalize(this);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static int IdentityHash(object key)
+        {
+            int hash = RuntimeHelpers.GetHashCode(key) & int.MaxValue;
+            return hash == 0 ? 1 : hash;
+        }
+
+        private sealed class Stripe
+        {
+            private SpinLock _gate = new SpinLock(false);
+            private int[] _hashes;
+            private GCHandle[] _keys;
+            private long[] _values;
+            private int _occupied;
+
+            internal Stripe(int capacity)
+            {
+                _hashes = new int[capacity];
+                _keys = new GCHandle[capacity];
+                _values = new long[capacity];
+            }
+
+            internal bool TryGetValueSynchronized(object key, int hash, out long identity)
+            {
+                bool taken = false;
+                try
+                {
+                    _gate.Enter(ref taken);
+                    return TryGetValue(key, hash, out identity);
+                }
+                finally { if (taken) _gate.Exit(false); }
+            }
+
+            internal void SetSynchronized(object key, int hash, long identity)
+            {
+                bool taken = false;
+                try
+                {
+                    _gate.Enter(ref taken);
+                    Set(key, hash, identity);
+                }
+                finally { if (taken) _gate.Exit(false); }
+            }
+
+            internal void RemoveSynchronized(object key, int hash)
+            {
+                bool taken = false;
+                try
+                {
+                    _gate.Enter(ref taken);
+                    Remove(key, hash);
+                }
+                finally { if (taken) _gate.Exit(false); }
+            }
+
+            internal void Dispose()
+            {
+                bool taken = false;
+                try
+                {
+                    _gate.Enter(ref taken);
+                    for (int i = 0; i < _keys.Length; i++)
+                        if (_keys[i].IsAllocated) _keys[i].Free();
+                    _hashes = Array.Empty<int>();
+                    _keys = Array.Empty<GCHandle>();
+                    _values = Array.Empty<long>();
+                    _occupied = 0;
+                }
+                finally { if (taken) _gate.Exit(false); }
+            }
+
+            private bool TryGetValue(object key, int hash, out long identity)
+            {
+                int mask = _hashes.Length - 1;
+                int slot = (hash >> 4) & mask;
+                for (int probe = 0; probe < _hashes.Length; probe++)
+                {
+                    int storedHash = _hashes[slot];
+                    if (storedHash == 0) break;
+                    if (storedHash == hash && _keys[slot].IsAllocated &&
+                        ReferenceEquals(_keys[slot].Target, key))
+                    {
+                        identity = _values[slot];
+                        return true;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+                identity = 0;
+                return false;
+            }
+
+            private void Set(object key, int hash, long identity)
+            {
+                if ((_occupied + 1) * 10 >= _hashes.Length * 7) Rebuild();
+                Insert(key, hash, identity);
+            }
+
+            private void Remove(object key, int hash)
+            {
+                int mask = _hashes.Length - 1;
+                int slot = (hash >> 4) & mask;
+                for (int probe = 0; probe < _hashes.Length; probe++)
+                {
+                    int storedHash = _hashes[slot];
+                    if (storedHash == 0) return;
+                    if (storedHash == hash && _keys[slot].IsAllocated &&
+                        ReferenceEquals(_keys[slot].Target, key))
+                    {
+                        _keys[slot].Free();
+                        _values[slot] = 0;
+                        return;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+            }
+
+            private void Insert(object key, int hash, long identity)
+            {
+                int mask = _hashes.Length - 1;
+                int slot = (hash >> 4) & mask;
+                int dead = -1;
+                for (int probe = 0; probe < _hashes.Length; probe++)
+                {
+                    int storedHash = _hashes[slot];
+                    if (storedHash == 0)
+                    {
+                        Write(dead >= 0 ? dead : slot, key, hash, identity, dead < 0);
+                        return;
+                    }
+                    object target = _keys[slot].IsAllocated ? _keys[slot].Target : null;
+                    if (target == null)
+                    {
+                        if (dead < 0) dead = slot;
+                    }
+                    else if (storedHash == hash && ReferenceEquals(target, key))
+                    {
+                        _values[slot] = identity;
+                        return;
+                    }
+                    slot = (slot + 1) & mask;
+                }
+                if (dead >= 0) { Write(dead, key, hash, identity, false); return; }
+                Resize(_hashes.Length * 2);
+                Insert(key, hash, identity);
+            }
+
+            private void Write(int slot, object key, int hash, long identity, bool newSlot)
+            {
+                _hashes[slot] = hash;
+                if (_keys[slot].IsAllocated) _keys[slot].Free();
+                _keys[slot] = GCHandle.Alloc(key, GCHandleType.Weak);
+                _values[slot] = identity;
+                if (newSlot) _occupied++;
+            }
+
+            private void Rebuild()
+            {
+                int live = 0;
+                for (int i = 0; i < _keys.Length; i++)
+                    if (_hashes[i] != 0 && _keys[i].IsAllocated && _keys[i].Target != null) live++;
+                Resize(live * 2 < _hashes.Length ? _hashes.Length : _hashes.Length * 2);
+            }
+
+            private void Resize(int capacity)
+            {
+                int[] oldHashes = _hashes;
+                GCHandle[] oldKeys = _keys;
+                long[] oldValues = _values;
+                _hashes = new int[capacity];
+                _keys = new GCHandle[capacity];
+                _values = new long[capacity];
+                _occupied = 0;
+                for (int i = 0; i < oldHashes.Length; i++)
+                {
+                    if (oldHashes[i] == 0 || !oldKeys[i].IsAllocated) continue;
+                    object target = oldKeys[i].Target;
+                    oldKeys[i].Free();
+                    if (target != null) Insert(target, oldHashes[i], oldValues[i]);
+                }
+            }
+        }
     }
 
     public enum LawfulTransitionKind { Entered, Updated, Left }
@@ -482,7 +764,7 @@ namespace Memory2
     {
         private const string PersistenceMagic = "M2LAWFUL-HIGHLEVEL-4";
         private readonly LawfulSchema _schema;
-        private readonly ConditionalWeakTable<object, LawfulIdentityBox> _identities = new ConditionalWeakTable<object, LawfulIdentityBox>();
+        private readonly WeakIdentityMap _identities;
         private readonly RootVisibilityLaw _rootVisibility;
         private uint[] _rootGeneration;
         private readonly Stream _stream;
@@ -506,7 +788,8 @@ namespace Memory2
         private int _subscriptionPublishDepth;
         private long _synchronizationApplies;
         private readonly Action<TRoot, long> _setRootId;
-        private readonly Dictionary<Type, HydrationPlan> _hydrationPlans = new Dictionary<Type, HydrationPlan>();
+        private readonly Action<int, TRoot> _fastRootIngest;
+        private readonly HydrationPlan[] _hydrationPlans;
         private readonly object _hydrationPlanGate = new object();
 
         internal LawfulMemoryStore(int initialRootCapacity, Action<LawfulSchemaBuilder<TRoot>> configure, Stream stream, bool leaveOpen)
@@ -516,6 +799,11 @@ namespace Memory2
             configure(builder);
             if (initialRootCapacity <= 0) initialRootCapacity = 1024;
             _schema = builder.Build(initialRootCapacity);
+            _hydrationPlans = new HydrationPlan[_schema.Shapes.Count()];
+            _identities = new WeakIdentityMap(_schema.Shapes.OrderBy(x => x.Ordinal).ToArray());
+            foreach (LawfulNodeShape shape in _schema.Shapes)
+                shape.WriteScalars = BuildObjectScalarWriter(shape);
+            _fastRootIngest = BuildFastRootIngester();
             _rootVisibility = new RootVisibilityLaw();
             _rootGeneration = new uint[initialRootCapacity];
             _stream = stream ?? new MemoryStream();
@@ -569,6 +857,188 @@ namespace Memory2
         internal Func<int, TResult> CompileQuerySelector<TNode, TResult>(LawfulNodeShape shape, Expression<Func<TNode, TResult>> selector)
             where TNode : class, new()
             => CompileScalarSelector(shape, selector);
+
+        internal LawfulCompiledCoordinateUpdate CompileCoordinateUpdate<TNode>(
+            LawfulNodeShape shape,
+            Expression<Func<TNode, TNode>> changes)
+            where TNode : class, new()
+        {
+            Expression body = changes.Body;
+            while (body is UnaryExpression unary &&
+                (unary.NodeType == ExpressionType.Convert || unary.NodeType == ExpressionType.ConvertChecked))
+                body = unary.Operand;
+            if (!(body is MemberInitExpression initializer) || initializer.NewExpression.Type != typeof(TNode))
+                throw new NotSupportedException(
+                    "A coordinate update must be a member initializer, for example x => new " +
+                    typeof(TNode).Name + " { Value = x.Value + 1 }.");
+
+            var byProperty = shape.Scalars.ToDictionary(x => x.Property, x => x);
+            var columns = new LawfulScalarColumn[initializer.Bindings.Count];
+            var changed = new Func<int, bool>[initializer.Bindings.Count];
+            var coordinate = Expression.Parameter(typeof(int), "coordinateIndex");
+            var variables = new List<ParameterExpression>(initializer.Bindings.Count);
+            var evaluations = new List<Expression>(initializer.Bindings.Count);
+            var writes = new List<Expression>(initializer.Bindings.Count);
+            var assigned = new HashSet<PropertyInfo>();
+
+            for (int i = 0; i < initializer.Bindings.Count; i++)
+            {
+                if (!(initializer.Bindings[i] is MemberAssignment assignment) ||
+                    !(assignment.Member is PropertyInfo property))
+                    throw new NotSupportedException("Coordinate updates support scalar property assignments only.");
+                if (!assigned.Add(property))
+                    throw new InvalidOperationException("The coordinate update assigns " + property.Name + " more than once.");
+                if (!byProperty.TryGetValue(property, out LawfulScalarColumn column))
+                    throw new NotSupportedException(
+                        property.DeclaringType.Name + "." + property.Name +
+                        " is not a stored scalar in this lawful schema.");
+
+                columns[i] = column;
+                var value = Expression.Variable(property.PropertyType, "value" + i.ToString());
+                variables.Add(value);
+                Expression rewritten = new CoordinateUpdateRewriter(
+                    changes.Parameters[0], coordinate, byProperty).Visit(assignment.Expression);
+                evaluations.Add(Expression.Assign(value, rewritten));
+                AppendScalarValueWrite(column, coordinate, value, writes);
+
+                var changedIndex = Expression.Parameter(typeof(int), "coordinateIndex");
+                Expression changedValue = new CoordinateUpdateRewriter(
+                    changes.Parameters[0], changedIndex, byProperty).Visit(assignment.Expression);
+                Expression currentValue = CreateColumnReadExpression(column, changedIndex, property.PropertyType);
+                Type comparerType = typeof(EqualityComparer<>).MakeGenericType(property.PropertyType);
+                PropertyInfo comparerDefault = comparerType.GetProperty(nameof(EqualityComparer<int>.Default));
+                MethodInfo equals = comparerType.GetMethod(nameof(EqualityComparer<int>.Equals), new[] { property.PropertyType, property.PropertyType });
+                Expression equal = Expression.Call(Expression.Property(null, comparerDefault), equals, currentValue, changedValue);
+                changed[i] = Expression.Lambda<Func<int, bool>>(Expression.Not(equal), changedIndex).Compile();
+            }
+
+            var operations = new List<Expression>(evaluations.Count + writes.Count);
+            operations.AddRange(evaluations);
+            operations.AddRange(writes);
+            Expression updateBody = operations.Count == 0
+                ? (Expression)Expression.Empty()
+                : Expression.Block(variables, operations);
+            Action<int> write = Expression.Lambda<Action<int>>(updateBody, coordinate).Compile();
+            Action<int[], int, int> bulkWrite = CompileBulkCoordinateUpdate<TNode>(
+                shape, changes.Parameters[0], initializer, byProperty, columns);
+            return new LawfulCompiledCoordinateUpdate(columns, changed, write, bulkWrite);
+        }
+
+        internal int ExecuteCoordinateUpdate(
+            LawfulNodeShape shape,
+            int[] coordinates,
+            int contiguousStart,
+            int count,
+            LawfulCompiledCoordinateUpdate update)
+        {
+            if (count == 0 || update.Columns.Length == 0) return count;
+            bool routeSubscriptions = _subscriptions.Count != 0;
+            if (!routeSubscriptions)
+            {
+                update.BulkWrite(coordinates, contiguousStart, count);
+                _directWrites += count;
+                return count;
+            }
+            for (int position = 0; position < count; position++)
+            {
+                int index = coordinates == null ? contiguousStart + position : coordinates[position];
+                ILawfulSubscription candidates = null;
+                if (routeSubscriptions)
+                    candidates = CaptureChangedSubscriptions(shape, index, update.Columns, update.Changed);
+                update.Write(index);
+                if (candidates != null)
+                {
+                    int rootIndex = index / shape.ItemsPerRoot;
+                    int localIndex = index - (rootIndex * shape.ItemsPerRoot);
+                    PublishChangedSubscriptions(candidates, shape, rootIndex, localIndex, index);
+                }
+            }
+            _directWrites += count;
+            return count;
+        }
+
+        private static Action<int[], int, int> CompileBulkCoordinateUpdate<TNode>(
+            LawfulNodeShape shape,
+            ParameterExpression model,
+            MemberInitExpression initializer,
+            Dictionary<PropertyInfo, LawfulScalarColumn> byProperty,
+            LawfulScalarColumn[] targetColumns)
+            where TNode : class, new()
+        {
+            var coordinates = Expression.Parameter(typeof(int[]), "coordinates");
+            var contiguousStart = Expression.Parameter(typeof(int), "contiguousStart");
+            var count = Expression.Parameter(typeof(int), "count");
+            var position = Expression.Variable(typeof(int), "position");
+            var index = Expression.Variable(typeof(int), "coordinateIndex");
+            var variables = new List<ParameterExpression> { position, index };
+            var prologue = new List<Expression>();
+            var arrays = new Dictionary<LawfulScalarColumn, ParameterExpression>();
+            var presence = new Dictionary<LawfulScalarColumn, ParameterExpression>();
+
+            foreach (LawfulScalarColumn column in shape.Scalars)
+            {
+                Type propertyType = column.Property.PropertyType;
+                Type storageType = Nullable.GetUnderlyingType(propertyType) ?? propertyType;
+                var array = Expression.Variable(storageType.MakeArrayType(), column.Property.Name + "Column");
+                variables.Add(array);
+                arrays.Add(column, array);
+                MethodInfo getArray = typeof(LawfulScalarColumn).GetMethod(
+                    "GetTypedArray", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(storageType);
+                prologue.Add(Expression.Assign(array, Expression.Call(Expression.Constant(column), getArray)));
+                if (Nullable.GetUnderlyingType(propertyType) != null)
+                {
+                    var hasValue = Expression.Variable(typeof(bool[]), column.Property.Name + "Presence");
+                    variables.Add(hasValue);
+                    presence.Add(column, hasValue);
+                    MethodInfo getPresence = typeof(LawfulScalarColumn).GetMethod(
+                        "GetHasValueArray", BindingFlags.Instance | BindingFlags.NonPublic);
+                    prologue.Add(Expression.Assign(hasValue, Expression.Call(Expression.Constant(column), getPresence)));
+                }
+            }
+
+            var values = new List<ParameterExpression>(initializer.Bindings.Count);
+            var evaluations = new List<Expression>(initializer.Bindings.Count);
+            var writes = new List<Expression>(initializer.Bindings.Count * 2);
+            var rewriter = new BulkCoordinateUpdateRewriter(model, index, byProperty, arrays, presence);
+            for (int i = 0; i < initializer.Bindings.Count; i++)
+            {
+                var assignment = (MemberAssignment)initializer.Bindings[i];
+                var property = (PropertyInfo)assignment.Member;
+                var value = Expression.Variable(property.PropertyType, "bulkValue" + i.ToString());
+                variables.Add(value);
+                values.Add(value);
+                evaluations.Add(Expression.Assign(value, rewriter.Visit(assignment.Expression)));
+                AppendBulkScalarValueWrite(targetColumns[i], index, value, arrays, presence, writes);
+            }
+
+            var loopBody = new List<Expression>(3 + evaluations.Count + writes.Count)
+            {
+                Expression.IfThen(
+                    Expression.GreaterThanOrEqual(position, count),
+                    Expression.Break(Expression.Label("bulkDone")))
+            };
+            // Replace the temporary break label with the one actually owned by this loop.
+            LabelTarget done = Expression.Label("bulkDone");
+            loopBody[0] = Expression.IfThen(
+                Expression.GreaterThanOrEqual(position, count),
+                Expression.Break(done));
+            loopBody.Add(Expression.Assign(
+                index,
+                Expression.Condition(
+                    Expression.Equal(coordinates, Expression.Constant(null, typeof(int[]))),
+                    Expression.Add(contiguousStart, position),
+                    Expression.ArrayIndex(coordinates, position))));
+            loopBody.AddRange(evaluations);
+            loopBody.AddRange(writes);
+            loopBody.Add(Expression.PostIncrementAssign(position));
+
+            var body = new List<Expression>(prologue.Count + 2);
+            body.AddRange(prologue);
+            body.Add(Expression.Assign(position, Expression.Constant(0)));
+            body.Add(Expression.Loop(Expression.Block(loopBody), done));
+            return Expression.Lambda<Action<int[], int, int>>(
+                Expression.Block(variables, body), coordinates, contiguousStart, count).Compile();
+        }
 
         internal IDisposable SubscribeQuery<TNode>(LawfulNodeShape shape, Expression<Func<TNode, bool>> predicate, Action<LawfulTransition> handler)
             where TNode : class, new()
@@ -699,9 +1169,9 @@ namespace Memory2
         public LawfulScalarMutation CreateMutation<TNode>(TNode model) where TNode : class
         {
             if (model == null) throw new ArgumentNullException(nameof(model));
-            if (!_identities.TryGetValue(model, out LawfulIdentityBox box)) throw new InvalidOperationException("The object was not materialized by this lawful store.");
-            object[] values = box.Identity.Shape.Scalars.Select(x => x.GetModelValue(model)).ToArray();
-            return new LawfulScalarMutation(Guid.NewGuid(), box.Identity.Shape.Type, box.Identity.RootIndex, box.Identity.LocalIndex, values);
+            if (!_identities.TryGetValue(model, out LawfulObjectIdentity identity)) throw new InvalidOperationException("The object was not materialized by this lawful store.");
+            object[] values = identity.Shape.Scalars.Select(x => x.GetModelValue(model)).ToArray();
+            return new LawfulScalarMutation(Guid.NewGuid(), identity.Shape.Type, identity.RootIndex, identity.LocalIndex, values);
         }
 
         public bool Apply(LawfulScalarMutation mutation)
@@ -722,11 +1192,11 @@ namespace Memory2
         public void Save<TNode>(TNode model) where TNode : class
         {
             if (model == null) throw new ArgumentNullException(nameof(model));
-            if (!_identities.TryGetValue(model, out LawfulIdentityBox box)) throw new InvalidOperationException("The object was not materialized by this lawful store.");
-            int index = Index(box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex);
-            ILawfulSubscription candidates = CaptureChangedSubscriptions(box.Identity.Shape, index, model);
-            WriteScalars(box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex, model);
-            PublishChangedSubscriptions(candidates, box.Identity.Shape, box.Identity.RootIndex, box.Identity.LocalIndex, index);
+            if (!_identities.TryGetValue(model, out LawfulObjectIdentity identity)) throw new InvalidOperationException("The object was not materialized by this lawful store.");
+            int index = Index(identity.Shape, identity.RootIndex, identity.LocalIndex);
+            ILawfulSubscription candidates = CaptureChangedSubscriptions(identity.Shape, index, model);
+            WriteScalars(identity.Shape, identity.RootIndex, identity.LocalIndex, model);
+            PublishChangedSubscriptions(candidates, identity.Shape, identity.RootIndex, identity.LocalIndex, index);
             _directWrites++;
         }
 
@@ -776,7 +1246,8 @@ namespace Memory2
         internal int CreateMany(TRoot[] roots)
         {
             if (roots == null) throw new ArgumentNullException(nameof(roots));
-            for (int i = 0; i < roots.Length; i++) CreateFast(roots[i]);
+            EnsureCapacityForAdditionalRoots(roots.Length);
+            for (int i = 0; i < roots.Length; i++) CreateFastWithCapacity(roots[i]);
             return roots.Length;
         }
 
@@ -786,6 +1257,105 @@ namespace Memory2
             int created = 0;
             foreach (TRoot root in roots) { Create(root); created++; }
             return created;
+        }
+
+        internal LawfulCompiledCoordinateCreate CompileCoordinateCreate(Expression<Func<int, TRoot>> factory)
+        {
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            var startRoot = Expression.Parameter(typeof(int), "startRoot");
+            var ordinalStart = Expression.Parameter(typeof(int), "ordinalStart");
+            var count = Expression.Parameter(typeof(int), "count");
+            var position = Expression.Variable(typeof(int), "position");
+            var rootIndex = Expression.Variable(typeof(int), "rootIndex");
+            var ordinal = Expression.Variable(typeof(int), "ordinal");
+            var assignments = new List<CoordinateCreateAssignment>();
+            CollectCoordinateCreateAssignments(
+                _schema.Root, factory.Body, null, 0, rootIndex, assignments, true);
+
+            var arrays = new Dictionary<LawfulScalarColumn, ParameterExpression>();
+            var presence = new Dictionary<LawfulScalarColumn, ParameterExpression>();
+            var variables = new List<ParameterExpression> { position, rootIndex, ordinal };
+            var prologue = new List<Expression>();
+            foreach (LawfulNodeShape shape in _schema.Shapes)
+            {
+                foreach (LawfulScalarColumn column in shape.Scalars)
+                {
+                    Type propertyType = column.Property.PropertyType;
+                    Type storageType = Nullable.GetUnderlyingType(propertyType) ?? propertyType;
+                    var array = Expression.Variable(storageType.MakeArrayType(),
+                        shape.Type.Name + column.Property.Name + "CreateColumn");
+                    variables.Add(array);
+                    arrays.Add(column, array);
+                    MethodInfo getArray = typeof(LawfulScalarColumn).GetMethod(
+                        "GetTypedArray", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(storageType);
+                    prologue.Add(Expression.Assign(array, Expression.Call(Expression.Constant(column), getArray)));
+                    if (Nullable.GetUnderlyingType(propertyType) != null)
+                    {
+                        var hasValue = Expression.Variable(typeof(bool[]),
+                            shape.Type.Name + column.Property.Name + "CreatePresence");
+                        variables.Add(hasValue);
+                        presence.Add(column, hasValue);
+                        MethodInfo getPresence = typeof(LawfulScalarColumn).GetMethod(
+                            "GetHasValueArray", BindingFlags.Instance | BindingFlags.NonPublic);
+                        prologue.Add(Expression.Assign(hasValue, Expression.Call(Expression.Constant(column), getPresence)));
+                    }
+                }
+            }
+
+            var evaluations = new List<Expression>(assignments.Count);
+            var writes = new List<Expression>(assignments.Count * 2);
+            var replaceOrdinal = new ParameterReplaceVisitor(factory.Parameters[0], ordinal);
+            for (int i = 0; i < assignments.Count; i++)
+            {
+                CoordinateCreateAssignment assignment = assignments[i];
+                Type propertyType = assignment.Column.Property.PropertyType;
+                var value = Expression.Variable(propertyType, "createValue" + i.ToString());
+                variables.Add(value);
+                Expression expression = replaceOrdinal.Visit(assignment.Value);
+                if (expression.Type != propertyType) expression = Expression.Convert(expression, propertyType);
+                evaluations.Add(Expression.Assign(value, expression));
+                AppendBulkScalarValueWrite(
+                    assignment.Column,
+                    replaceOrdinal.Visit(assignment.Coordinate),
+                    value,
+                    arrays,
+                    presence,
+                    writes);
+            }
+
+            LabelTarget done = Expression.Label("createDone");
+            var loopBody = new List<Expression>(5 + evaluations.Count + writes.Count)
+            {
+                Expression.IfThen(Expression.GreaterThanOrEqual(position, count), Expression.Break(done)),
+                Expression.Assign(rootIndex, Expression.Add(startRoot, position)),
+                Expression.Assign(ordinal, Expression.Add(ordinalStart, position))
+            };
+            loopBody.AddRange(evaluations);
+            loopBody.AddRange(writes);
+            loopBody.Add(Expression.PostIncrementAssign(position));
+
+            var body = new List<Expression>(prologue.Count + 2);
+            body.AddRange(prologue);
+            body.Add(Expression.Assign(position, Expression.Constant(0)));
+            body.Add(Expression.Loop(Expression.Block(loopBody), done));
+            Action<int, int, int> write = Expression.Lambda<Action<int, int, int>>(
+                Expression.Block(variables, body), startRoot, ordinalStart, count).Compile();
+            return new LawfulCompiledCoordinateCreate(write, assignments.Count);
+        }
+
+        internal int ExecuteCoordinateCreate(
+            LawfulCompiledCoordinateCreate create,
+            int ordinalStart,
+            int count)
+        {
+            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+            if (count == 0) return 0;
+            EnsureCapacityForAdditionalRoots(count);
+            int startRoot = _nextRoot;
+            create.Write(startRoot, ordinalStart, count);
+            for (int i = 0; i < count; i++) _rootGeneration[startRoot + i] = 1;
+            _nextRoot = checked(startRoot + count);
+            return count;
         }
 
         public TResult[] SelectToArray<TNode, TResult>(Expression<Func<TNode, TResult>> selector) where TNode : class, new()
@@ -991,6 +1561,21 @@ namespace Memory2
             if (_nextRoot == int.MaxValue) throw new InvalidOperationException("The CLR indexed-column limit has been reached.");
             int required = checked(_nextRoot + 1);
             _schema.EnsureRootCapacity(required);
+            InvalidateHydrationPlans();
+            if (_rootGeneration.Length < _schema.AllocatedRootCapacity)
+                Array.Resize(ref _rootGeneration, _schema.AllocatedRootCapacity);
+        }
+
+        private void EnsureCapacityForAdditionalRoots(int count)
+        {
+            if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+            if (count == 0) return;
+            long requiredLong = (long)_nextRoot + count;
+            if (requiredLong > int.MaxValue) throw new InvalidOperationException("The CLR indexed-column limit has been reached.");
+            int required = (int)requiredLong;
+            if (required <= _schema.AllocatedRootCapacity) return;
+            _schema.EnsureRootCapacity(required);
+            InvalidateHydrationPlans();
             if (_rootGeneration.Length < _schema.AllocatedRootCapacity)
                 Array.Resize(ref _rootGeneration, _schema.AllocatedRootCapacity);
         }
@@ -1010,11 +1595,17 @@ namespace Memory2
         {
             if (root == null) throw new ArgumentNullException(nameof(root));
             EnsureCapacityForNextRoot();
+            return CreateFastWithCapacity(root);
+        }
+
+        private TRoot CreateFastWithCapacity(TRoot root)
+        {
+            if (root == null) throw new ArgumentNullException(nameof(root));
             int rootIndex = _nextRoot++;
             _rootGeneration[rootIndex] = 1;
             _setRootId?.Invoke(root, rootIndex + 1L);
             // Batch ingestion is storage-native: descendants receive identity only when queried/materialized.
-            Ingest(_schema.Root, rootIndex, 0, root, false);
+            _fastRootIngest(rootIndex, root);
             return root;
         }
 
@@ -1063,9 +1654,7 @@ namespace Memory2
             if ((uint)rootIndex >= (uint)_nextRoot || !_rootVisibility.IsVisible(rootIndex)) return false;
             reader(rootIndex, destination);
             _setRootId?.Invoke(destination, rootIndex + 1L);
-            var identity = new LawfulObjectIdentity(_schema.Root, rootIndex, 0);
-            if (_identities.TryGetValue(destination, out LawfulIdentityBox box)) box.Identity = identity;
-            else _identities.Add(destination, new LawfulIdentityBox(identity));
+            _identities.Set(destination, new LawfulObjectIdentity(_schema.Root, rootIndex, 0));
             return true;
         }
 
@@ -1096,6 +1685,111 @@ namespace Memory2
             var columns = shape.Scalars.ToDictionary(x => x.Property, x => x);
             Expression body = new ScalarSelectorRewriter(selector.Parameters[0], index, columns).Visit(selector.Body);
             return Expression.Lambda<Func<int, TResult>>(body, index).Compile();
+        }
+
+        private static Expression CreateColumnReadExpression(
+            LawfulScalarColumn column,
+            Expression index,
+            Type propertyType)
+        {
+            Type nullable = Nullable.GetUnderlyingType(propertyType);
+            if (nullable != null)
+            {
+                MethodInfo readNullable = typeof(LawfulScalarColumn).GetMethod(
+                    "ReadNullableValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(nullable);
+                return Expression.Call(Expression.Constant(column), readNullable, index);
+            }
+            MethodInfo readTyped = typeof(LawfulScalarColumn).GetMethod(nameof(LawfulScalarColumn.ReadTyped))
+                .MakeGenericMethod(propertyType);
+            return Expression.Call(Expression.Constant(column), readTyped, index);
+        }
+
+        private sealed class CoordinateUpdateRewriter : ExpressionVisitor
+        {
+            private readonly ParameterExpression _model;
+            private readonly ParameterExpression _index;
+            private readonly Dictionary<PropertyInfo, LawfulScalarColumn> _columns;
+
+            internal CoordinateUpdateRewriter(
+                ParameterExpression model,
+                ParameterExpression index,
+                Dictionary<PropertyInfo, LawfulScalarColumn> columns)
+            {
+                _model = model;
+                _index = index;
+                _columns = columns;
+            }
+
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Expression == _model && node.Member is PropertyInfo property)
+                {
+                    if (!_columns.TryGetValue(property, out LawfulScalarColumn column))
+                        throw new NotSupportedException(
+                            property.DeclaringType.Name + "." + property.Name +
+                            " is not a stored scalar in this lawful schema.");
+                    return CreateColumnReadExpression(column, _index, property.PropertyType);
+                }
+                return base.VisitMember(node);
+            }
+
+            protected override Expression VisitParameter(ParameterExpression node)
+            {
+                if (node == _model)
+                    throw new NotSupportedException(
+                        "Coordinate updates cannot materialize the complete model; assign from scalar properties instead.");
+                return base.VisitParameter(node);
+            }
+        }
+
+        private sealed class BulkCoordinateUpdateRewriter : ExpressionVisitor
+        {
+            private readonly ParameterExpression _model;
+            private readonly ParameterExpression _index;
+            private readonly Dictionary<PropertyInfo, LawfulScalarColumn> _columns;
+            private readonly Dictionary<LawfulScalarColumn, ParameterExpression> _arrays;
+            private readonly Dictionary<LawfulScalarColumn, ParameterExpression> _presence;
+
+            internal BulkCoordinateUpdateRewriter(
+                ParameterExpression model,
+                ParameterExpression index,
+                Dictionary<PropertyInfo, LawfulScalarColumn> columns,
+                Dictionary<LawfulScalarColumn, ParameterExpression> arrays,
+                Dictionary<LawfulScalarColumn, ParameterExpression> presence)
+            {
+                _model = model;
+                _index = index;
+                _columns = columns;
+                _arrays = arrays;
+                _presence = presence;
+            }
+
+            protected override Expression VisitMember(MemberExpression node)
+            {
+                if (node.Expression == _model && node.Member is PropertyInfo property)
+                {
+                    if (!_columns.TryGetValue(property, out LawfulScalarColumn column))
+                        throw new NotSupportedException(
+                            property.DeclaringType.Name + "." + property.Name +
+                            " is not a stored scalar in this lawful schema.");
+                    Expression value = Expression.ArrayIndex(_arrays[column], _index);
+                    Type nullable = Nullable.GetUnderlyingType(property.PropertyType);
+                    if (nullable == null) return value;
+                    return Expression.Condition(
+                        Expression.ArrayIndex(_presence[column], _index),
+                        Expression.Convert(value, property.PropertyType),
+                        Expression.Default(property.PropertyType));
+                }
+                return base.VisitMember(node);
+            }
+
+            protected override Expression VisitParameter(ParameterExpression node)
+            {
+                if (node == _model)
+                    throw new NotSupportedException(
+                        "Coordinate updates cannot materialize the complete model; assign from scalar properties instead.");
+                return base.VisitParameter(node);
+            }
         }
 
         private static Action<int, TNode> CompileScalarReader<TNode>(LawfulNodeShape shape) where TNode : class, new()
@@ -1164,10 +1858,7 @@ namespace Memory2
             if (model == null) throw new InvalidOperationException("Lawful fixed relationships cannot contain null nodes.");
             WriteScalars(shape, rootIndex, localIndex, model);
             if (attachIdentity)
-            {
-                _identities.Remove(model);
-                _identities.Add(model, new LawfulIdentityBox(new LawfulObjectIdentity(shape, rootIndex, localIndex)));
-            }
+                _identities.Set(model, new LawfulObjectIdentity(shape, rootIndex, localIndex));
             foreach (LawfulNodeShape child in shape.Children)
             {
                 object value = child.Incoming.Getter(model);
@@ -1196,7 +1887,18 @@ namespace Memory2
         private object Hydrate(LawfulNodeShape shape, int rootIndex, int localIndex)
         {
             HydrationPlan plan = GetHydrationPlan(shape);
+            return Hydrate(plan, rootIndex, localIndex);
+        }
+
+        private object Hydrate(HydrationPlan plan, int rootIndex, int localIndex)
+        {
             object model = plan.Factory();
+            return HydrateInto(plan, rootIndex, localIndex, model);
+        }
+
+        private object HydrateInto(HydrationPlan plan, int rootIndex, int localIndex, object model)
+        {
+            LawfulNodeShape shape = plan.Shape;
             plan.ReadScalars(Index(shape, rootIndex, localIndex), model);
             for (int i = 0; i < plan.Children.Length; i++)
             {
@@ -1207,36 +1909,64 @@ namespace Memory2
                     int count = child.Shape.CardinalityFromParent;
                     if (child.IsArray)
                     {
-                        Array array = Array.CreateInstance(child.Shape.Type, count);
+                        Array array = child.Get(model) as Array;
+                        bool assign = false;
+                        if (array == null || array.Length != count)
+                        {
+                            array = Array.CreateInstance(child.Shape.Type, count);
+                            assign = true;
+                        }
                         for (int ordinal = 0; ordinal < count; ordinal++)
-                            child.SetArrayItem(array, ordinal, Hydrate(child.Shape, rootIndex, firstLocal + ordinal));
-                        child.Set(model, array);
+                            child.SetArrayItem(array, ordinal, Hydrate(child.Plan, rootIndex, firstLocal + ordinal));
+                        if (assign) child.Set(model, array);
                     }
                     else
                     {
-                        IList list = child.CreateList(count);
+                        IList list = child.Get(model) as IList;
+                        bool assign = false;
+                        if (list == null || list.IsReadOnly || list.IsFixedSize)
+                        {
+                            list = child.CreateList(count);
+                            assign = true;
+                        }
+                        else
+                            list.Clear();
                         for (int ordinal = 0; ordinal < count; ordinal++)
-                            list.Add(Hydrate(child.Shape, rootIndex, firstLocal + ordinal));
-                        child.Set(model, list);
+                            list.Add(Hydrate(child.Plan, rootIndex, firstLocal + ordinal));
+                        if (assign) child.Set(model, list);
                     }
                 }
-                else child.Set(model, Hydrate(child.Shape, rootIndex, localIndex));
+                else
+                {
+                    object nested = child.Get(model);
+                    if (nested == null)
+                        child.Set(model, HydrateInto(child.Plan, rootIndex, localIndex, child.Plan.Factory()));
+                    else
+                        HydrateInto(child.Plan, rootIndex, localIndex, nested);
+                }
             }
-            _identities.Remove(model);
-            _identities.Add(model, new LawfulIdentityBox(new LawfulObjectIdentity(shape, rootIndex, localIndex)));
+            _identities.Set(model, new LawfulObjectIdentity(shape, rootIndex, localIndex));
             _materializations++;
             return model;
         }
 
         private HydrationPlan GetHydrationPlan(LawfulNodeShape shape)
         {
+            HydrationPlan cached = Volatile.Read(ref _hydrationPlans[shape.Ordinal]);
+            if (cached != null) return cached;
             lock (_hydrationPlanGate)
             {
-                if (_hydrationPlans.TryGetValue(shape.Type, out HydrationPlan existing)) return existing;
+                HydrationPlan existing = _hydrationPlans[shape.Ordinal];
+                if (existing != null) return existing;
                 HydrationPlan created = BuildHydrationPlan(shape);
-                _hydrationPlans.Add(shape.Type, created);
+                Volatile.Write(ref _hydrationPlans[shape.Ordinal], created);
                 return created;
             }
+        }
+
+        private void InvalidateHydrationPlans()
+        {
+            lock (_hydrationPlanGate) Array.Clear(_hydrationPlans, 0, _hydrationPlans.Length);
         }
 
         private HydrationPlan BuildHydrationPlan(LawfulNodeShape shape)
@@ -1277,9 +2007,338 @@ namespace Memory2
                     listFactory = Expression.Lambda<Func<int, IList>>(
                         Expression.Convert(Expression.New(ctor, capacity), typeof(IList)), capacity).Compile();
                 }
-                children[i] = new HydrationChild(child, child.Incoming.IsCollection, isArray, setter, listFactory, arrayItemSetter);
+                children[i] = new HydrationChild(child, GetHydrationPlan(child), child.Incoming.Getter, child.Incoming.IsCollection, isArray, setter, listFactory, arrayItemSetter);
             }
-            return new HydrationPlan(factory, reader, children);
+            return new HydrationPlan(shape, factory, reader, children);
+        }
+
+        private static Action<int, object> BuildObjectScalarWriter(LawfulNodeShape shape)
+        {
+            MethodInfo writerBuilder = typeof(LawfulMemoryStore<TRoot>).GetMethod(nameof(CompileScalarWriter), BindingFlags.Static | BindingFlags.NonPublic).MakeGenericMethod(shape.Type);
+            return (Action<int, object>)writerBuilder.Invoke(null, new object[] { shape });
+        }
+
+        private static Action<int, object> CompileScalarWriter<TNode>(LawfulNodeShape shape) where TNode : class
+        {
+            var index = Expression.Parameter(typeof(int), "coordinateIndex");
+            var model = Expression.Parameter(typeof(object), "model");
+            Expression typedModel = Expression.Convert(model, typeof(TNode));
+            var writes = new List<Expression>(shape.Scalars.Count);
+            AppendScalarWrites(shape, index, typedModel, writes);
+            Expression body = writes.Count == 0 ? Expression.Empty() : Expression.Block(writes);
+            return Expression.Lambda<Action<int, object>>(body, index, model).Compile();
+        }
+
+        private Action<int, TRoot> BuildFastRootIngester()
+        {
+            var rootIndex = Expression.Parameter(typeof(int), "rootIndex");
+            var root = Expression.Parameter(typeof(TRoot), "root");
+            var variables = new List<ParameterExpression>();
+            var body = new List<Expression>();
+            AppendFastIngest(_schema.Root, rootIndex, Expression.Constant(0), root, variables, body);
+            return Expression.Lambda<Action<int, TRoot>>(
+                Expression.Block(variables, body), rootIndex, root).Compile();
+        }
+
+        private static void AppendFastIngest(
+            LawfulNodeShape shape,
+            Expression rootIndex,
+            Expression localIndex,
+            Expression model,
+            List<ParameterExpression> variables,
+            List<Expression> body)
+        {
+            Expression coordinate = Expression.AddChecked(
+                Expression.MultiplyChecked(rootIndex, Expression.Constant(shape.ItemsPerRoot)),
+                localIndex);
+            AppendScalarWrites(shape, coordinate, model, body);
+
+            for (int i = 0; i < shape.Children.Count; i++)
+            {
+                LawfulNodeShape child = shape.Children[i];
+                PropertyInfo property = child.Incoming.Property;
+                Expression propertyValue = Expression.Property(model, property);
+                if (!child.Incoming.IsCollection)
+                {
+                    var childModel = Expression.Variable(child.Type, "ingestNode" + variables.Count.ToString());
+                    variables.Add(childModel);
+                    body.Add(Expression.Assign(childModel, Expression.Convert(propertyValue, child.Type)));
+                    body.Add(Expression.IfThen(
+                        Expression.Equal(childModel, Expression.Constant(null, child.Type)),
+                        Expression.Throw(Expression.New(
+                            typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) }),
+                            Expression.Constant("Lawful fixed relationships cannot contain null nodes.")))));
+                    AppendFastIngest(child, rootIndex, localIndex, childModel, variables, body);
+                    continue;
+                }
+
+                var items = Expression.Variable(typeof(IList), "ingestItems" + variables.Count.ToString());
+                variables.Add(items);
+                body.Add(Expression.IfThen(
+                    Expression.Equal(propertyValue, Expression.Constant(null, property.PropertyType)),
+                    Expression.Throw(Expression.New(
+                        typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) }),
+                        Expression.Constant(property.Name + " cannot be null.")))));
+                body.Add(Expression.Assign(items, Expression.TypeAs(Expression.Convert(propertyValue, typeof(object)), typeof(IList))));
+                body.Add(Expression.IfThen(
+                    Expression.Equal(items, Expression.Constant(null, typeof(IList))),
+                    Expression.Throw(Expression.New(
+                        typeof(NotSupportedException).GetConstructor(new[] { typeof(string) }),
+                        Expression.Constant("Lawful fixed collections must implement IList: " + property.Name)))));
+                body.Add(Expression.IfThen(
+                    Expression.NotEqual(Expression.Property(items, typeof(ICollection).GetProperty(nameof(ICollection.Count))), Expression.Constant(child.CardinalityFromParent)),
+                    Expression.Throw(Expression.New(
+                        typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) }),
+                        Expression.Constant(property.Name + " must contain exactly " + child.CardinalityFromParent.ToString() + " items.")))));
+
+                Expression firstLocal = Expression.MultiplyChecked(localIndex, Expression.Constant(child.CardinalityFromParent));
+                PropertyInfo itemProperty = typeof(IList).GetProperty("Item");
+                for (int ordinal = 0; ordinal < child.CardinalityFromParent; ordinal++)
+                {
+                    var childModel = Expression.Variable(child.Type, "ingestNode" + variables.Count.ToString());
+                    variables.Add(childModel);
+                    body.Add(Expression.Assign(
+                        childModel,
+                        Expression.Convert(Expression.Property(items, itemProperty, Expression.Constant(ordinal)), child.Type)));
+                    body.Add(Expression.IfThen(
+                        Expression.Equal(childModel, Expression.Constant(null, child.Type)),
+                        Expression.Throw(Expression.New(
+                            typeof(InvalidOperationException).GetConstructor(new[] { typeof(string) }),
+                            Expression.Constant("Lawful fixed relationships cannot contain null nodes.")))));
+                    AppendFastIngest(
+                        child,
+                        rootIndex,
+                        Expression.AddChecked(firstLocal, Expression.Constant(ordinal)),
+                        childModel,
+                        variables,
+                        body);
+                }
+            }
+        }
+
+        private static void AppendScalarWrites(LawfulNodeShape shape, Expression index, Expression model, List<Expression> writes)
+        {
+            foreach (LawfulScalarColumn column in shape.Scalars)
+            {
+                PropertyInfo property = column.Property;
+                Type nullable = Nullable.GetUnderlyingType(property.PropertyType);
+                MethodInfo method;
+                if (nullable != null)
+                    method = typeof(LawfulScalarColumn).GetMethod("WriteNullableModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(nullable);
+                else if (property.PropertyType.IsValueType)
+                    method = typeof(LawfulScalarColumn).GetMethod("WriteValueModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(property.PropertyType);
+                else
+                    method = typeof(LawfulScalarColumn).GetMethod("WriteReferenceModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(property.PropertyType);
+                writes.Add(Expression.Call(Expression.Constant(column), method, index, Expression.Property(model, property)));
+            }
+        }
+
+        private static void AppendScalarValueWrite(
+            LawfulScalarColumn column,
+            Expression index,
+            Expression value,
+            List<Expression> writes)
+        {
+            Type propertyType = column.Property.PropertyType;
+            Type nullable = Nullable.GetUnderlyingType(propertyType);
+            MethodInfo method;
+            if (nullable != null)
+                method = typeof(LawfulScalarColumn).GetMethod(
+                    "WriteNullableModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(nullable);
+            else if (propertyType.IsValueType)
+                method = typeof(LawfulScalarColumn).GetMethod(
+                    "WriteValueModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(propertyType);
+            else
+                method = typeof(LawfulScalarColumn).GetMethod(
+                    "WriteReferenceModelValue", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(propertyType);
+            writes.Add(Expression.Call(Expression.Constant(column), method, index, value));
+        }
+
+        private static void AppendBulkScalarValueWrite(
+            LawfulScalarColumn column,
+            Expression index,
+            Expression value,
+            Dictionary<LawfulScalarColumn, ParameterExpression> arrays,
+            Dictionary<LawfulScalarColumn, ParameterExpression> presence,
+            List<Expression> writes)
+        {
+            Type propertyType = column.Property.PropertyType;
+            Type nullable = Nullable.GetUnderlyingType(propertyType);
+            if (nullable == null)
+            {
+                writes.Add(Expression.Assign(Expression.ArrayAccess(arrays[column], index), value));
+                return;
+            }
+
+            PropertyInfo hasValue = propertyType.GetProperty(nameof(Nullable<int>.HasValue));
+            MethodInfo getValueOrDefault = propertyType.GetMethod(nameof(Nullable<int>.GetValueOrDefault), Type.EmptyTypes);
+            writes.Add(Expression.Assign(
+                Expression.ArrayAccess(presence[column], index),
+                Expression.Property(value, hasValue)));
+            writes.Add(Expression.Assign(
+                Expression.ArrayAccess(arrays[column], index),
+                Expression.Call(value, getValueOrDefault)));
+        }
+
+        private void CollectCoordinateCreateAssignments(
+            LawfulNodeShape shape,
+            Expression initializerExpression,
+            object constantModel,
+            int localIndex,
+            ParameterExpression rootIndex,
+            List<CoordinateCreateAssignment> output,
+            bool isRoot)
+        {
+            Dictionary<PropertyInfo, Expression> members = null;
+            object defaults = constantModel;
+            if (initializerExpression != null)
+            {
+                initializerExpression = StripConvert(initializerExpression);
+                if (initializerExpression is MemberInitExpression memberInit && memberInit.NewExpression.Type == shape.Type)
+                {
+                    if (memberInit.NewExpression.Arguments.Count != 0)
+                        throw new NotSupportedException("Coordinate creation requires parameterless node constructors.");
+                    members = new Dictionary<PropertyInfo, Expression>();
+                    foreach (MemberBinding binding in memberInit.Bindings)
+                    {
+                        if (!(binding is MemberAssignment assignment) || !(assignment.Member is PropertyInfo property))
+                            throw new NotSupportedException("Coordinate creation supports property assignments only.");
+                        members.Add(property, assignment.Expression);
+                    }
+                    defaults = Activator.CreateInstance(shape.Type);
+                }
+                else if (initializerExpression is NewExpression construction &&
+                    construction.Type == shape.Type && construction.Arguments.Count == 0)
+                {
+                    members = new Dictionary<PropertyInfo, Expression>();
+                    defaults = Activator.CreateInstance(shape.Type);
+                }
+                else
+                    throw new NotSupportedException(
+                        "Coordinate creation requires new " + shape.Type.Name + " { ... } for every owned node.");
+            }
+            if (defaults == null) throw new InvalidOperationException("A lawful owned node cannot be null.");
+
+            var scalarProperties = new HashSet<PropertyInfo>(shape.Scalars.Select(x => x.Property));
+            var childProperties = new HashSet<PropertyInfo>(shape.Children.Select(x => x.Incoming.Property));
+            if (members != null)
+            {
+                foreach (PropertyInfo property in members.Keys)
+                {
+                    if (!scalarProperties.Contains(property) && !childProperties.Contains(property))
+                        throw new NotSupportedException(
+                            property.DeclaringType.Name + "." + property.Name +
+                            " is not stored by this lawful schema.");
+                }
+            }
+
+            Expression coordinate = Expression.AddChecked(
+                Expression.MultiplyChecked(rootIndex, Expression.Constant(shape.ItemsPerRoot)),
+                Expression.Constant(localIndex));
+            foreach (LawfulScalarColumn column in shape.Scalars)
+            {
+                Expression value;
+                if (isRoot && column.Property.Name == "Id" && column.Property.PropertyType == typeof(long))
+                    value = Expression.Convert(Expression.AddChecked(rootIndex, Expression.Constant(1)), typeof(long));
+                else if (members != null && members.TryGetValue(column.Property, out Expression assigned))
+                    value = assigned;
+                else
+                    value = Expression.Constant(column.GetModelValue(defaults), column.Property.PropertyType);
+                output.Add(new CoordinateCreateAssignment(column, coordinate, value));
+            }
+
+            foreach (LawfulNodeShape child in shape.Children)
+            {
+                Expression relation = null;
+                object constantRelation = null;
+                if (members == null || !members.TryGetValue(child.Incoming.Property, out relation))
+                    constantRelation = child.Incoming.Getter(defaults);
+
+                if (!child.Incoming.IsCollection)
+                {
+                    if (relation != null)
+                        CollectCoordinateCreateAssignments(child, relation, null, localIndex, rootIndex, output, false);
+                    else
+                        CollectCoordinateCreateAssignments(child, null, constantRelation, localIndex, rootIndex, output, false);
+                    continue;
+                }
+
+                if (relation != null)
+                {
+                    List<Expression> elements = ExtractCoordinateCreateElements(relation, child.Incoming.Property.Name);
+                    if (elements.Count != child.CardinalityFromParent)
+                        throw new InvalidOperationException(
+                            child.Incoming.Property.Name + " must contain exactly " +
+                            child.CardinalityFromParent.ToString() + " items.");
+                    for (int item = 0; item < elements.Count; item++)
+                        CollectCoordinateCreateAssignments(
+                            child, elements[item], null,
+                            checked(localIndex * child.CardinalityFromParent + item),
+                            rootIndex, output, false);
+                }
+                else
+                {
+                    if (!(constantRelation is IList list) || list.Count != child.CardinalityFromParent)
+                        throw new InvalidOperationException(
+                            child.Incoming.Property.Name + " must contain exactly " +
+                            child.CardinalityFromParent.ToString() + " items.");
+                    for (int item = 0; item < list.Count; item++)
+                        CollectCoordinateCreateAssignments(
+                            child, null, list[item],
+                            checked(localIndex * child.CardinalityFromParent + item),
+                            rootIndex, output, false);
+                }
+            }
+        }
+
+        private static List<Expression> ExtractCoordinateCreateElements(Expression expression, string propertyName)
+        {
+            expression = StripConvert(expression);
+            var result = new List<Expression>();
+            if (expression is ListInitExpression list)
+            {
+                foreach (ElementInit item in list.Initializers)
+                {
+                    if (item.Arguments.Count != 1)
+                        throw new NotSupportedException("Coordinate creation supports one-argument collection initializers only.");
+                    result.Add(item.Arguments[0]);
+                }
+                return result;
+            }
+            if (expression is NewArrayExpression array)
+            {
+                result.AddRange(array.Expressions);
+                return result;
+            }
+            throw new NotSupportedException(
+                propertyName + " must use an inline list or array initializer for coordinate creation.");
+        }
+
+        private static Expression StripConvert(Expression expression)
+        {
+            while (expression is UnaryExpression unary &&
+                (unary.NodeType == ExpressionType.Convert || unary.NodeType == ExpressionType.ConvertChecked))
+                expression = unary.Operand;
+            return expression;
+        }
+
+        private sealed class CoordinateCreateAssignment
+        {
+            internal CoordinateCreateAssignment(LawfulScalarColumn column, Expression coordinate, Expression value)
+            { Column = column; Coordinate = coordinate; Value = value; }
+            internal readonly LawfulScalarColumn Column;
+            internal readonly Expression Coordinate;
+            internal readonly Expression Value;
+        }
+
+        private sealed class ParameterReplaceVisitor : ExpressionVisitor
+        {
+            private readonly ParameterExpression _source;
+            private readonly Expression _replacement;
+            internal ParameterReplaceVisitor(ParameterExpression source, Expression replacement)
+            { _source = source; _replacement = replacement; }
+            protected override Expression VisitParameter(ParameterExpression node)
+                => node == _source ? _replacement : base.VisitParameter(node);
         }
 
         private static Action<int, object> BuildObjectScalarReader<TNode>(LawfulNodeShape shape) where TNode : class, new()
@@ -1290,8 +2349,9 @@ namespace Memory2
 
         private sealed class HydrationPlan
         {
-            internal HydrationPlan(Func<object> factory, Action<int, object> readScalars, HydrationChild[] children)
-            { Factory = factory; ReadScalars = readScalars; Children = children; }
+            internal HydrationPlan(LawfulNodeShape shape, Func<object> factory, Action<int, object> readScalars, HydrationChild[] children)
+            { Shape = shape; Factory = factory; ReadScalars = readScalars; Children = children; }
+            internal readonly LawfulNodeShape Shape;
             internal readonly Func<object> Factory;
             internal readonly Action<int, object> ReadScalars;
             internal readonly HydrationChild[] Children;
@@ -1299,9 +2359,11 @@ namespace Memory2
 
         private sealed class HydrationChild
         {
-            internal HydrationChild(LawfulNodeShape shape, bool isCollection, bool isArray, Action<object, object> set, Func<int, IList> createList, Action<Array, int, object> setArrayItem)
-            { Shape = shape; IsCollection = isCollection; IsArray = isArray; Set = set; CreateList = createList; SetArrayItem = setArrayItem; }
+            internal HydrationChild(LawfulNodeShape shape, HydrationPlan plan, Func<object, object> get, bool isCollection, bool isArray, Action<object, object> set, Func<int, IList> createList, Action<Array, int, object> setArrayItem)
+            { Shape = shape; Plan = plan; Get = get; IsCollection = isCollection; IsArray = isArray; Set = set; CreateList = createList; SetArrayItem = setArrayItem; }
             internal readonly LawfulNodeShape Shape;
+            internal readonly HydrationPlan Plan;
+            internal readonly Func<object, object> Get;
             internal readonly bool IsCollection;
             internal readonly bool IsArray;
             internal readonly Action<object, object> Set;
@@ -1313,7 +2375,7 @@ namespace Memory2
         private static void WriteScalars(LawfulNodeShape shape, int rootIndex, int localIndex, object model)
         {
             int index = Index(shape, rootIndex, localIndex);
-            foreach (LawfulScalarColumn column in shape.Scalars) column.WriteModel(index, model);
+            shape.WriteScalars(index, model);
         }
         private static void ReadScalars(LawfulNodeShape shape, int rootIndex, int localIndex, object model)
         {
@@ -1416,6 +2478,25 @@ namespace Memory2
                 if (column.BoxedValueEquals(index, values[i])) continue;
                 changed = true;
                 RouteColumnSubscribers(column, index, epoch, _subscriptionPublishDepth, ref head);
+            }
+            if (changed) RouteWildcardSubscribers(shape, index, epoch, _subscriptionPublishDepth, ref head);
+            return head;
+        }
+
+        private ILawfulSubscription CaptureChangedSubscriptions(
+            LawfulNodeShape shape,
+            int index,
+            LawfulScalarColumn[] columns,
+            Func<int, bool>[] changedTests)
+        {
+            long epoch = unchecked(++_subscriptionDispatchEpoch);
+            ILawfulSubscription head = null;
+            bool changed = false;
+            for (int i = 0; i < columns.Length; i++)
+            {
+                if (!changedTests[i](index)) continue;
+                changed = true;
+                RouteColumnSubscribers(columns[i], index, epoch, _subscriptionPublishDepth, ref head);
             }
             if (changed) RouteWildcardSubscribers(shape, index, epoch, _subscriptionPublishDepth, ref head);
             return head;
@@ -1644,14 +2725,10 @@ namespace Memory2
 
         public void Dispose()
         {
+            _identities.Dispose();
             if (!_leaveOpen) _stream.Dispose();
         }
 
-        private sealed class LawfulIdentityBox
-        {
-            public LawfulIdentityBox(LawfulObjectIdentity identity) { Identity = identity; }
-            public LawfulObjectIdentity Identity { get; set; }
-        }
     }
 
     public sealed class LawfulProjectionPlan<TRoot, TNode, TResult>
@@ -1730,6 +2807,18 @@ namespace Memory2
         public TRoot Create(TRoot model) => _store.Create(model);
         public int CreateMany(IEnumerable<TRoot> models) => _store.CreateMany(models);
         public int CreateMany(TRoot[] models) => _store.CreateMany(models);
+        /// <summary>
+        /// Compiles a root factory into direct typed-column creation. The expression describes
+        /// values and fixed owned relationships but does not construct models at execution time.
+        /// </summary>
+        public LawfulPreparedCreatePlan<TRoot> PrepareCreate(Expression<Func<int, TRoot>> factory)
+        {
+            if (factory == null) throw new ArgumentNullException(nameof(factory));
+            return new LawfulPreparedCreatePlan<TRoot>(_store, _store.CompileCoordinateCreate(factory));
+        }
+        /// <summary>Creates a batch directly from a LINQ expression without allocating a POCO graph per root.</summary>
+        public int CreateMany(int count, Expression<Func<int, TRoot>> factory)
+            => PrepareCreate(factory).Execute(count);
         public TRoot Get(long id) => _store.Get(id);
         public TRoot Load(long id) => _store.Load(id);
         public bool TryLoad(long id, out TRoot model) => _store.TryLoad(id, out model);

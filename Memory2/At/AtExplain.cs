@@ -12,6 +12,10 @@ namespace Memory2.At
         public int Residue { get; internal set; }
         public int ResidueCount { get; internal set; }
         public int RelationTermCount { get; internal set; }
+        public string PhysicalPlan { get; internal set; } = "AffineAt";
+        public int CompiledAtLength { get; internal set; }
+        public int CompiledAtUniqueLeaves { get; internal set; }
+        public int CompiledAtUniqueNodes { get; internal set; }
 
         public int SuppliedTermCount { get; internal set; }
         public int EncodedTermCount { get; internal set; }
@@ -25,7 +29,7 @@ namespace Memory2.At
         public override string ToString()
         {
             return $"AT Explain: Model={ModelType?.Name}, Terms={SuppliedTermCount}, Encoded={EncodedTermCount}, Dropped={DroppedTermCount}, " +
-                   $"Relations={RelationTermCount}, M={Modulus}, residues={ResidueCount}, r={Residue}, ExpectedProbes≈{ExpectedProbes}";
+                   $"Relations={RelationTermCount}, Physical={PhysicalPlan}, M={Modulus}, residues={ResidueCount}, r={Residue}, ExpectedProbes≈{ExpectedProbes}";
         }
     }
 }

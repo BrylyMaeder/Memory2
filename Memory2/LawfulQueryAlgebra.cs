@@ -133,6 +133,32 @@ namespace Memory2
             return new LawfulPreparedNodeCountPlan<TRoot, TNode, TResult>(_coordinates, _contiguousStart, _count, _store.CompileQuerySelector(_shape, predicate), _store.CompileQuerySelector(_shape, selector), _diagnostics);
         }
 
+        /// <summary>
+        /// Compiles a LINQ-shaped partial update directly against Memory2's scalar columns.
+        /// Assigned properties change; omitted properties remain untouched. No model is hydrated.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// var accept = store.From&lt;Event&gt;()
+        ///     .Where(x =&gt; x.Score &gt;= 90)
+        ///     .PrepareUpdate(x =&gt; new Event { Accepted = true, Score = x.Score + 1 });
+        /// accept.Execute();
+        /// </code>
+        /// </example>
+        public LawfulPreparedUpdatePlan<TRoot, TNode> PrepareUpdate(Expression<Func<TNode, TNode>> changes)
+        {
+            if (changes == null) throw new ArgumentNullException(nameof(changes));
+            return new LawfulPreparedUpdatePlan<TRoot, TNode>(
+                _store, _shape, _coordinates, _contiguousStart, _count,
+                _store.CompileCoordinateUpdate(_shape, changes), _diagnostics);
+        }
+
+        /// <summary>Executes a storage-native partial update once, without hydrating models.</summary>
+        public int Update(Expression<Func<TNode, TNode>> changes) => PrepareUpdate(changes).Execute();
+
+        /// <summary>LINQ-style alias for Update.</summary>
+        public int ExecuteUpdate(Expression<Func<TNode, TNode>> changes) => Update(changes);
+
         public LawfulNodeQuery<TRoot, TNode> Where(Expression<Func<TNode, bool>> predicate)
         {
             if (predicate == null) throw new ArgumentNullException(nameof(predicate));
@@ -246,6 +272,53 @@ namespace Memory2
             private readonly ParameterExpression _to;
             public ParameterReplaceVisitor(ParameterExpression from, ParameterExpression to) { _from = from; _to = to; }
             protected override Expression VisitParameter(ParameterExpression node) => node == _from ? _to : base.VisitParameter(node);
+        }
+    }
+
+    /// <summary>
+    /// A reusable, allocation-free coordinate update compiled from a LINQ expression.
+    /// The selected coordinates are the snapshot captured by the source query.
+    /// </summary>
+    public sealed class LawfulPreparedUpdatePlan<TRoot, TNode>
+        where TRoot : class, new()
+        where TNode : class, new()
+    {
+        private readonly LawfulMemoryStore<TRoot> _store;
+        private readonly LawfulNodeShape _shape;
+        private readonly int[] _coordinates;
+        private readonly int _contiguousStart;
+        private readonly int _count;
+        private readonly LawfulCompiledCoordinateUpdate _compiled;
+        private readonly LawfulQueryDiagnostics _diagnostics;
+
+        internal LawfulPreparedUpdatePlan(
+            LawfulMemoryStore<TRoot> store,
+            LawfulNodeShape shape,
+            int[] coordinates,
+            int contiguousStart,
+            int count,
+            LawfulCompiledCoordinateUpdate compiled,
+            LawfulQueryDiagnostics diagnostics)
+        {
+            _store = store;
+            _shape = shape;
+            _coordinates = coordinates;
+            _contiguousStart = contiguousStart;
+            _count = count;
+            _compiled = compiled;
+            _diagnostics = diagnostics;
+        }
+
+        public int TargetCount => _count;
+        public int AssignedColumnCount => _compiled.Columns.Length;
+
+        public int Execute()
+        {
+            int updated = _store.ExecuteCoordinateUpdate(
+                _shape, _coordinates, _contiguousStart, _count, _compiled);
+            _diagnostics.CoordinateVisits += updated;
+            _diagnostics.OperatorExecutions++;
+            return updated;
         }
     }
 

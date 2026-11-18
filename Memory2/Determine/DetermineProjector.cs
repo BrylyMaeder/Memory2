@@ -20,7 +20,13 @@ namespace Memory2.Determine
         public T DetermineBase(long id)
         {
             var obj = new T();
+            PopulateGeneratedAxes(obj, id);
+            TrySetId(obj, id);
+            return obj;
+        }
 
+        internal void PopulateGeneratedAxes(T obj, long id)
+        {
             for (int i = 0; i < _schema.AxisCount; i++)
             {
                 var axis = _schema.GetAxis(i);
@@ -28,10 +34,12 @@ namespace Memory2.Determine
                 object value = DetermineValue(axis, code);
                 axis.Setter(obj, value);
             }
+        }
 
-            // ✅ Fix: Set Id for *any* supported numeric type (not just long)
+        internal T CreateShell(long id)
+        {
+            var obj = new T();
             TrySetId(obj, id);
-
             return obj;
         }
 
