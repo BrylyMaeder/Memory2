@@ -89,6 +89,16 @@ namespace Memory2
             return new MemoryStore(new MemoryStream(), false, true, options);
         }
 
+        /// <summary>Creates a fixed-shape typed store through the primary MemoryStore API.</summary>
+        public static MemoryStore<TRoot> Create<TRoot>(Action<LawfulSchemaBuilder<TRoot>> configure, Stream stream = null, bool leaveOpen = false, int initialCapacity = 1024)
+            where TRoot : class, new()
+            => new MemoryStore<TRoot>(initialCapacity, configure, stream, leaveOpen);
+
+        /// <summary>Creates a fixed-shape typed store with an explicit initial capacity.</summary>
+        public static MemoryStore<TRoot> Create<TRoot>(int initialCapacity, Action<LawfulSchemaBuilder<TRoot>> configure, Stream stream = null, bool leaveOpen = false)
+            where TRoot : class, new()
+            => new MemoryStore<TRoot>(initialCapacity, configure, stream, leaveOpen);
+
         public MemorySet<T> Set<T>() where T : class, new()
         {
             ThrowIfDisposed();

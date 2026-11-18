@@ -15,6 +15,21 @@ namespace Memory2.Tests
                 .OwnsOne<ExceptionalUsage, ExceptionalMetadata>(x => x.Metadata), stream, true);
 
         [TestMethod]
+        public void MemoryStore_is_the_primary_fixed_shape_entry_point()
+        {
+            using MemoryStore<ExceptionalWorld> store = MemoryStore.Create<ExceptionalWorld>(schema => schema
+                .OwnsMany<ExceptionalWorld, ExceptionalCar>(x => x.Cars, 2)
+                .OwnsMany<ExceptionalCar, ExceptionalTire>(x => x.Tires, 4)
+                .OwnsMany<ExceptionalTire, ExceptionalUsage>(x => x.Usage, 1)
+                .OwnsOne<ExceptionalUsage, ExceptionalMetadata>(x => x.Metadata));
+
+            ExceptionalWorld created = store.Set().Create(BuildWorld("public-memory-store"));
+
+            Assert.AreEqual(created.Id, store.Set().Load(created.Id).Id);
+            Assert.AreEqual(8, store.From<ExceptionalTire>().Count);
+        }
+
+        [TestMethod]
         public void Public_lawful_api_queries_and_saves_descendants_without_root_rewrite()
         {
             using var db = Create();

@@ -760,7 +760,7 @@ namespace Memory2
         internal object[] Values { get; }
     }
 
-    public sealed class LawfulMemoryStore<TRoot> : IDisposable where TRoot : class, new()
+    public class LawfulMemoryStore<TRoot> : IDisposable where TRoot : class, new()
     {
         private const string PersistenceMagic = "M2LAWFUL-HIGHLEVEL-4";
         private readonly LawfulSchema _schema;
@@ -2844,6 +2844,16 @@ namespace Memory2
         public LawfulDeletePlan<TRoot> PrepareDelete(long[] ids) => _store.PrepareDelete(ids);
     }
 
+    /// <summary>
+    /// The fixed-shape Memory2 store exposed by the primary public API.
+    /// </summary>
+    public sealed class MemoryStore<TRoot> : LawfulMemoryStore<TRoot> where TRoot : class, new()
+    {
+        internal MemoryStore(int initialRootCapacity, Action<LawfulSchemaBuilder<TRoot>> configure, Stream stream, bool leaveOpen)
+            : base(initialRootCapacity, configure, stream, leaveOpen) { }
+    }
+
+    /// <summary>Compatibility factory for the former public entry point.</summary>
     public static class LawfulMemoryStore
     {
         public static LawfulMemoryStore<TRoot> Create<TRoot>(Action<LawfulSchemaBuilder<TRoot>> configure, Stream stream = null, bool leaveOpen = false, int initialCapacity = 1024)
