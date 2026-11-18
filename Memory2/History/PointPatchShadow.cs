@@ -504,10 +504,9 @@ namespace Memory2.History
                         int compiledBeforeFields = beforeOverride == null ? compiled.GetFieldCount(id) :
                             ReferenceEquals(beforeOverride, CompiledTombstone) ? 0 : beforeOverride.FieldCount;
                         if (beforeOverride == null)
-                        {
                             Interlocked.Increment(ref _compiledOverrideCount);
+                        if (beforeOverride == null || compiledBeforeExists != (requested != null))
                             Interlocked.Increment(ref _patchedIdVersion);
-                        }
                         if (beforeOverride != null && !ReferenceEquals(beforeOverride, CompiledTombstone))
                             Interlocked.Add(ref _payloadBytes, -beforeOverride.EstimatedPayloadBytes);
                         if (requested != null) Interlocked.Add(ref _payloadBytes, requested.EstimatedPayloadBytes);

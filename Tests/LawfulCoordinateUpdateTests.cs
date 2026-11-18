@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
@@ -213,6 +214,35 @@ public sealed class LawfulCoordinateUpdateTests
         Assert.AreEqual(0L, allocated);
         Assert.AreEqual(1_024, store.Count);
         Assert.AreEqual(999, store.From<CreateRoot>().Select(x => x.Score).ToArray()[999]);
+    }
+
+    [TestMethod]
+    public void Prepared_reference_writes_survive_persistence()
+    {
+        using var stream = new MemoryStream();
+        using (MemoryStore<UpdateRow> store = MemoryStore.Create<UpdateRow>(2, schema => schema
+            .IncludeScalar<UpdateRow, long>(x => x.Id)
+            .IncludeScalar<UpdateRow, int>(x => x.Score)
+            .IncludeScalar<UpdateRow, string>(x => x.Name), stream, true))
+        {
+            store.Set().PrepareCreate(i => new UpdateRow
+            {
+                Score = i,
+                Name = i == 0 ? "created" : null
+            }).Execute(2);
+            store.From<UpdateRow>()
+                .Where(x => x.Score == 1)
+                .Update(x => new UpdateRow { Name = "updated" });
+            store.Save();
+        }
+
+        using MemoryStore<UpdateRow> reopened = MemoryStore.Create<UpdateRow>(2, schema => schema
+            .IncludeScalar<UpdateRow, long>(x => x.Id)
+            .IncludeScalar<UpdateRow, int>(x => x.Score)
+            .IncludeScalar<UpdateRow, string>(x => x.Name), stream, true);
+        CollectionAssert.AreEqual(
+            new[] { "created", "updated" },
+            reopened.From<UpdateRow>().Select(x => x.Name).ToArray());
     }
 
     [TestMethod]

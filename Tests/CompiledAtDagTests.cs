@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -301,6 +302,55 @@ namespace Memory2.Tests
             Assert.AreEqual("AffineAt+SharedDag+SparseOverrides", explain.PhysicalPlan);
             Assert.AreEqual(Population, explain.CompiledAtLength);
             Assert.AreEqual(values.LongCount(x => x.Region == 10_002), prepared.Count(0, Population));
+        }
+
+        [TestMethod]
+        public void Restored_compiled_patch_reenters_relation_results()
+        {
+            Collection<DagRecord> records = MemoryDb.Create().For<DagRecord>();
+            var generated = new DagRecord[Population];
+            var patched = new DagRecord[Population];
+            for (int id = 0; id < Population; id++)
+            {
+                DagRecord value = records.Get(id);
+                generated[id] = new DagRecord
+                {
+                    Id = id,
+                    Region = value.Region,
+                    Status = value.Status,
+                    Category = value.Category,
+                    Value = value.Value
+                };
+                patched[id] = new DagRecord
+                {
+                    Id = id,
+                    Region = value.Region ^ int.MinValue,
+                    Status = value.Status,
+                    Category = value.Category,
+                    Value = value.Value
+                };
+            }
+            records.UpsertMany(patched);
+            Assert.IsTrue(records.GetStatistics().SurfaceMill.HasCompiledAtSurface);
+
+            const int target = int.MaxValue;
+            int selected = Array.FindIndex(generated, x => x.Status != target);
+            records.Upsert(generated[selected]);
+            PreparedAtRelation<DagRecord> relation = records.Relations()
+                .Equal(x => x.Status == target)
+                .Prepare();
+            Assert.IsFalse(relation.ResolveIds(0, Population).Contains(selected));
+
+            records.Upsert(new DagRecord
+            {
+                Id = selected,
+                Region = generated[selected].Region ^ int.MinValue,
+                Status = target,
+                Category = generated[selected].Category,
+                Value = generated[selected].Value
+            });
+
+            Assert.IsTrue(relation.ResolveIds(0, Population).Contains(selected));
         }
 
         private static Collection<DagRecord> Build(out DagRecord[] values)

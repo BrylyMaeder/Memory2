@@ -985,7 +985,7 @@ namespace Memory2
                 MethodInfo getArray = typeof(LawfulScalarColumn).GetMethod(
                     "GetTypedArray", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(storageType);
                 prologue.Add(Expression.Assign(array, Expression.Call(Expression.Constant(column), getArray)));
-                if (Nullable.GetUnderlyingType(propertyType) != null)
+                if (!propertyType.IsValueType || Nullable.GetUnderlyingType(propertyType) != null)
                 {
                     var hasValue = Expression.Variable(typeof(bool[]), column.Property.Name + "Presence");
                     variables.Add(hasValue);
@@ -1289,7 +1289,7 @@ namespace Memory2
                     MethodInfo getArray = typeof(LawfulScalarColumn).GetMethod(
                         "GetTypedArray", BindingFlags.Instance | BindingFlags.NonPublic).MakeGenericMethod(storageType);
                     prologue.Add(Expression.Assign(array, Expression.Call(Expression.Constant(column), getArray)));
-                    if (Nullable.GetUnderlyingType(propertyType) != null)
+                    if (!propertyType.IsValueType || Nullable.GetUnderlyingType(propertyType) != null)
                     {
                         var hasValue = Expression.Variable(typeof(bool[]),
                             shape.Type.Name + column.Property.Name + "CreatePresence");
@@ -2164,8 +2164,17 @@ namespace Memory2
         {
             Type propertyType = column.Property.PropertyType;
             Type nullable = Nullable.GetUnderlyingType(propertyType);
+            if (nullable == null && propertyType.IsValueType)
+            {
+                writes.Add(Expression.Assign(Expression.ArrayAccess(arrays[column], index), value));
+                return;
+            }
+
             if (nullable == null)
             {
+                writes.Add(Expression.Assign(
+                    Expression.ArrayAccess(presence[column], index),
+                    Expression.NotEqual(value, Expression.Constant(null, propertyType))));
                 writes.Add(Expression.Assign(Expression.ArrayAccess(arrays[column], index), value));
                 return;
             }
